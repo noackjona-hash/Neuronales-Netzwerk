@@ -7,8 +7,8 @@ fn test_evolution_convergence() {
     let config = EvolutionConfig {
         population_size: 50,
         elitism_count: 5,
-        mutation_rate: 0.10,
-        mutation_strength: 0.25,
+        base_mutation_rate: 0.10,
+        base_mutation_strength: 0.25,
         tournament_size: 4,
         max_generation_time: 25.0,
         ..Default::default()

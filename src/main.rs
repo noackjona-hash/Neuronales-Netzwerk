@@ -56,7 +56,7 @@ fn window_conf() -> Conf {
         window_width: 1280,
         window_height: 720,
         window_resizable: true,
-        high_dpi: false, // Prevents Wayland/X11 GL buffer mismatch crash on resize/maximize
+        high_dpi: false,
         fullscreen: false,
         ..Default::default()
     }
@@ -88,7 +88,7 @@ async fn main() {
                 // Step Population
                 state.population.step(dt_fixed, &state.track);
 
-                // Collect skid marks from skidding/drifting cars
+                // Collect skid marks
                 collect_skid_marks(&mut state);
 
                 // Step Manual Player Car if active
@@ -133,10 +133,11 @@ fn init_app_state() -> AppState {
     let config = EvolutionConfig {
         population_size: 70,
         elitism_count: 5,
-        mutation_rate: 0.10,
-        mutation_strength: 0.25,
+        base_mutation_rate: 0.09,
+        base_mutation_strength: 0.24,
         tournament_size: 4,
         max_generation_time: 45.0,
+        novelty_ratio: 0.15,
         ..Default::default()
     };
 
@@ -162,7 +163,7 @@ fn init_app_state() -> AppState {
         show_help: false,
         show_sensors: true,
         skid_marks: Vec::with_capacity(2048),
-        toast_message: Some(("NeuroRacer: Deep Neural Network & Realistic Physics! [H] for controls.".to_string(), 4.5)),
+        toast_message: Some(("NeuroRacer: Adaptive Evolution Engine! [H] for controls.".to_string(), 4.5)),
     }
 }
 
@@ -490,7 +491,7 @@ fn draw_world(state: &AppState) {
     // Dead cars
     for agent in &state.population.agents {
         if !agent.car.is_alive {
-            draw_car_body(&agent.car, Color::new(0.4, 0.4, 0.4, 0.25), false);
+            draw_car_body(&agent.car, Color::new(0.4, 0.4, 0.4, 0.25), false, false);
         }
     }
 
@@ -500,7 +501,7 @@ fn draw_world(state: &AppState) {
             let is_leader = i == leader_idx;
             let c = agent.color_rgba;
             let car_color = Color::from_rgba(c[0], c[1], c[2], c[3]);
-            draw_car_body(&agent.car, car_color, is_leader);
+            draw_car_body(&agent.car, car_color, is_leader, agent.is_novelty_immigrant);
         }
     }
 
@@ -512,11 +513,11 @@ fn draw_world(state: &AppState) {
             } else {
                 Color::new(0.8, 0.2, 0.2, 0.5)
             };
-            draw_car_body(player, player_col, true);
+            draw_car_body(player, player_col, true, false);
         }
     }
 
-    // 7. Sensor Rays for Leader Car
+    // 7. 9 Dynamic Lookahead Sensor Rays for Leader Car
     if state.show_sensors && !state.population.agents.is_empty() {
         let leader_car = if state.manual_drive && state.player_car.as_ref().map_or(false, |c| c.is_alive) {
             state.player_car.as_ref().unwrap()
@@ -591,17 +592,19 @@ fn draw_track_boundaries(track: &Track) {
     }
 }
 
-fn draw_car_body(car: &Car, color: Color, is_highlighted: bool) {
+fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool) {
     let corners = car.bounding_box_corners();
     let fwd = car.forward_vector();
     let right = car.right_vector();
 
-    // 1. Leader Glow Aura
+    // 1. Leader / Novelty Glow Aura
     if is_highlighted && car.is_alive {
         draw_poly(car.position.x, car.position.y, 16, 26.0, 0.0, Color::new(1.0, 0.84, 0.0, 0.25));
+    } else if is_novelty && car.is_alive {
+        draw_poly(car.position.x, car.position.y, 16, 22.0, 0.0, Color::new(1.0, 0.4, 0.7, 0.20));
     }
 
-    // 2. Realistic Turned Front Wheels & Rear Drive Wheels
+    // 2. Realistic Steered Front Wheels & Rear Drive Wheels
     let wheel_w = 4.0;
     let wheel_l = 8.0;
 
@@ -622,7 +625,7 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool) {
     draw_wheel(rl_wheel, fwd, right, wheel_l, wheel_w);
     draw_wheel(rr_wheel, fwd, right, wheel_l, wheel_w);
 
-    // 3. Car Chassis (2 Triangles forming OBB)
+    // 3. Car Chassis
     draw_triangle(
         vec2(corners[0].x, corners[0].y),
         vec2(corners[1].x, corners[1].y),
@@ -693,6 +696,7 @@ fn draw_wheel(center: Vec2, fwd: Vec2, right: Vec2, len: f32, width: f32) {
 
 fn draw_car_sensors(car: &Car) {
     let sensor_origin = car.position + car.forward_vector() * (car.config.length * 0.4);
+    let ray_range = car.current_sensor_range();
 
     for (i, hit_opt) in car.sensor_hits.iter().enumerate() {
         let frac = car.sensor_readings[i];
@@ -709,7 +713,7 @@ fn draw_car_sensors(car: &Car) {
             Some(h) => h.point,
             None => {
                 let angle = car.heading_angle + car.config.ray_sensor_angles[i];
-                sensor_origin + Vec2::from_angle(angle) * car.config.ray_sensor_range
+                sensor_origin + Vec2::from_angle(angle) * ray_range
             }
         };
 
@@ -746,6 +750,7 @@ fn draw_hud(state: &AppState) {
     let time = state.population.generation_time;
     let best_fit = state.population.current_best_fitness();
     let record_fit = state.population.best_ever_fitness;
+    let temp = state.population.mutation_temperature;
 
     let font_size = 18.0;
     let y_text = 33.0;
@@ -754,7 +759,7 @@ fn draw_hud(state: &AppState) {
     draw_text("NEURO-RACER", 18.0, y_text, 22.0, Color::new(0.2, 0.85, 1.0, 1.0));
 
     // Responsive stats layout
-    let col_w = (scr_w - 200.0) / 6.0;
+    let col_w = (scr_w - 200.0) / 7.0;
     draw_text(&format!("GEN: {}", gen), 180.0, y_text, font_size, WHITE);
     draw_text(
         &format!("ALIVE: {}/{}", alive, total),
@@ -767,8 +772,24 @@ fn draw_hud(state: &AppState) {
     draw_text(&format!("BEST: {:.0}", best_fit), 180.0 + col_w * 3.0, y_text, font_size, Color::new(1.0, 0.85, 0.2, 1.0));
     draw_text(&format!("RECORD: {:.0}", record_fit), 180.0 + col_w * 4.0, y_text, font_size, Color::new(0.4, 1.0, 0.6, 1.0));
 
+    // Stagnation / Mutation Temperature indicator
+    let temp_col = if temp > 1.8 {
+        Color::new(1.0, 0.3, 0.2, 1.0) // Red (Hypermutation Active)
+    } else if temp > 1.2 {
+        Color::new(1.0, 0.8, 0.2, 1.0) // Yellow (Heating up)
+    } else {
+        Color::new(0.3, 0.9, 0.5, 1.0) // Green (Fine-tuning)
+    };
+    draw_text(
+        &format!("MUT TEMP: {:.1}x", temp),
+        180.0 + col_w * 5.0,
+        y_text,
+        font_size,
+        temp_col,
+    );
+
     let speed_text = if state.paused { "PAUSED" } else { &format!("{}x", state.sim_speed) };
-    draw_text(&format!("SPD: {}", speed_text), 180.0 + col_w * 5.0, y_text, font_size, Color::new(0.9, 0.6, 1.0, 1.0));
+    draw_text(&format!("SPD: {}", speed_text), 180.0 + col_w * 6.0, y_text, font_size, Color::new(0.9, 0.6, 1.0, 1.0));
 
     // 2. Deep Neural Network Visualizer HUD (Bottom-Right)
     if state.show_nn_hud && !state.population.agents.is_empty() {
@@ -905,7 +926,7 @@ fn draw_deep_neural_network_hud(agent: &evolution::Agent, x: f32, y: f32, w: f32
 
     // Telemetry text
     draw_text(
-        &format!("SPD: {:.0}km/h | SLIP: {:.1}°", speed_kmh, slip_deg),
+        &format!("SPD: {:.0}km/h | SLIP: {:.1}° | APEX: {:+.1}°", speed_kmh, slip_deg, agent.car.next_target_angle_diff * 180.0),
         x + 15.0,
         meter_y - 12.0,
         12.0,
@@ -927,7 +948,7 @@ fn draw_deep_neural_network_hud(agent: &evolution::Agent, x: f32, y: f32, w: f32
 
 fn draw_fitness_graph(history: &[evolution::GenerationStats], x: f32, y: f32, w: f32, h: f32) {
     draw_rectangle(x, y, w, h, Color::new(0.04, 0.06, 0.09, 0.94));
-    draw_rectangle_lines(x, y, w, h, 1.5, Color::new(0.2, 0.4, 0.6, 0.7));
+    draw_rectangle_lines(x, y, w, h, 1.5, Color::new(0.2, 0.45, 0.7, 0.75));
 
     draw_text("FITNESS EVOLUTION", x + 10.0, y + 18.0, 14.0, Color::new(1.0, 0.85, 0.2, 0.95));
 

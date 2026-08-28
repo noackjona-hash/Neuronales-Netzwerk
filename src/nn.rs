@@ -12,20 +12,14 @@ use serde::{Deserialize, Serialize};
 /// Activation functions for neural network layers.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Activation {
-    /// Rectified Linear Unit: max(0, x)
     ReLU,
-    /// Leaky ReLU: max(alpha * x, x)
     LeakyReLU { alpha: f32 },
-    /// Hyperbolic Tangent: (e^x - e^-x) / (e^x + e^-x) -> [-1, 1]
     Tanh,
-    /// Logistic Sigmoid: 1 / (1 + e^-x) -> [0, 1]
     Sigmoid,
-    /// Linear identity: f(x) = x
     Linear,
 }
 
 impl Activation {
-    /// Apply scalar activation function manually from scratch.
     #[inline(always)]
     pub fn apply(&self, x: f32) -> f32 {
         match self {
@@ -61,7 +55,6 @@ impl Activation {
         }
     }
 
-    /// In-place batch activation across a slice.
     pub fn apply_slice(&self, slice: &mut [f32]) {
         for val in slice.iter_mut() {
             *val = self.apply(*val);
@@ -80,7 +73,6 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// Create a new layer with Xavier/Glorot or He weight initialization.
     pub fn new<R: Rng + ?Sized>(
         in_features: usize,
         out_features: usize,
@@ -111,7 +103,6 @@ impl Layer {
         }
     }
 
-    /// Forward pass: y = activation(W * x + b).
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut output = vec![0.0; self.out_features];
         self.weights.forward_linear(input, &self.biases, &mut output);
@@ -119,38 +110,35 @@ impl Layer {
         output
     }
 
-    /// Forward pass into a mutable slice.
     pub fn forward_into(&self, input: &[f32], output: &mut [f32]) {
         self.weights.forward_linear(input, &self.biases, output);
         self.activation.apply_slice(output);
     }
 
-    /// Mutate layer weights and biases with Gaussian noise.
     pub fn mutate<R: Rng + ?Sized>(&mut self, rate: f32, strength: f32, rng: &mut R) {
         for w in self.weights.data.iter_mut() {
             if rng.gen::<f32>() < rate {
-                if rng.gen::<f32>() < 0.90 {
+                if rng.gen::<f32>() < 0.88 {
                     *w += GaussianRng::sample(0.0, strength, rng);
                 } else {
-                    *w = GaussianRng::sample(0.0, 1.0, rng);
+                    *w = GaussianRng::sample(0.0, 1.2, rng);
                 }
-                *w = w.clamp(-5.0, 5.0);
+                *w = w.clamp(-6.0, 6.0);
             }
         }
 
         for b in self.biases.iter_mut() {
             if rng.gen::<f32>() < rate {
-                if rng.gen::<f32>() < 0.90 {
+                if rng.gen::<f32>() < 0.88 {
                     *b += GaussianRng::sample(0.0, strength, rng);
                 } else {
-                    *b = GaussianRng::sample(0.0, 1.0, rng);
+                    *b = GaussianRng::sample(0.0, 1.2, rng);
                 }
-                *b = b.clamp(-5.0, 5.0);
+                *b = b.clamp(-6.0, 6.0);
             }
         }
     }
 
-    /// Crossover two layers of identical topology.
     pub fn crossover<R: Rng + ?Sized>(
         parent_a: &Layer,
         parent_b: &Layer,
@@ -176,7 +164,7 @@ impl Layer {
             } else if weight_choice < 0.90 {
                 wb
             } else {
-                let alpha: f32 = rng.gen_range(-0.1..1.1);
+                let alpha: f32 = rng.gen_range(-0.15..1.15);
                 wa * alpha + wb * (1.0 - alpha)
             };
             new_weights_data.push(w);
@@ -212,7 +200,6 @@ pub struct NeuralNetwork {
 }
 
 impl NeuralNetwork {
-    /// Construct a neural network with given topology and activations per layer.
     pub fn new<R: Rng + ?Sized>(
         layer_sizes: &[usize],
         activations: &[Activation],
@@ -244,24 +231,22 @@ impl NeuralNetwork {
         }
     }
 
-    /// Create deep car driving brain architecture with 4 hidden layers:
-    /// Topology: [11 -> 32 -> 24 -> 16 -> 12 -> 2]
-    /// Total layers: 6 (Input + 4 Hidden Layers + Output)
+    /// Deep car driving brain architecture with 4 hidden layers:
+    /// Topology: [12 -> 32 -> 24 -> 16 -> 12 -> 2]
     pub fn default_car_brain<R: Rng + ?Sized>(rng: &mut R) -> Self {
         Self::new(
-            &[11, 32, 24, 16, 12, 2],
+            &[12, 32, 24, 16, 12, 2],
             &[
-                Activation::LeakyReLU { alpha: 0.05 }, // Hidden 1: 32 (Feature extraction)
-                Activation::ReLU,                      // Hidden 2: 24 (Trajectory & curve detection)
-                Activation::Tanh,                      // Hidden 3: 16 (Grip & lateral dynamics)
-                Activation::Tanh,                      // Hidden 4: 12 (Control strategy blending)
-                Activation::Tanh,                      // Output: 2 (Steering & Gas/Brake)
+                Activation::LeakyReLU { alpha: 0.05 }, // Hidden 1: 32 (Raycast spatial perception)
+                Activation::ReLU,                      // Hidden 2: 24 (Corner geometry & speed prediction)
+                Activation::Tanh,                      // Hidden 3: 16 (Grip limits & lateral slip control)
+                Activation::Tanh,                      // Hidden 4: 12 (Steering & braking blending)
+                Activation::Tanh,                      // Output: 2 (Steer & Gas/Brake)
             ],
             rng,
         )
     }
 
-    /// Forward pass through all layers.
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         assert_eq!(
             input.len(),
@@ -278,7 +263,6 @@ impl NeuralNetwork {
         current
     }
 
-    /// Forward pass returning intermediate layer activations for visualizer HUD.
     pub fn forward_with_cache(&self, input: &[f32]) -> (Vec<f32>, Vec<Vec<f32>>) {
         let mut activations = Vec::with_capacity(self.layers.len() + 1);
         activations.push(input.to_vec());
@@ -292,14 +276,12 @@ impl NeuralNetwork {
         (current, activations)
     }
 
-    /// Mutate all network layers in-place.
     pub fn mutate<R: Rng + ?Sized>(&mut self, rate: f32, strength: f32, rng: &mut R) {
         for layer in &mut self.layers {
             layer.mutate(rate, strength, rng);
         }
     }
 
-    /// Genetic crossover of two parent neural networks.
     pub fn crossover<R: Rng + ?Sized>(
         parent_a: &NeuralNetwork,
         parent_b: &NeuralNetwork,
@@ -318,17 +300,14 @@ impl NeuralNetwork {
         }
     }
 
-    /// Serialize topology and weights to JSON string.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 
-    /// Deserialize topology and weights from JSON string.
     pub fn from_json(json_str: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json_str)
     }
 
-    /// Total trainable parameters (weights + biases).
     pub fn parameter_count(&self) -> usize {
         let mut count = 0;
         for layer in &self.layers {
@@ -349,10 +328,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let net = NeuralNetwork::default_car_brain(&mut rng);
 
-        assert_eq!(net.layer_sizes, vec![11, 32, 24, 16, 12, 2]);
+        assert_eq!(net.layer_sizes, vec![12, 32, 24, 16, 12, 2]);
         assert_eq!(net.layers.len(), 5);
 
-        let input = vec![0.5, 0.6, 0.7, 0.8, 0.9, 0.4, 0.3, 0.75, 0.0, 0.0, 0.1];
+        let input = vec![0.5, 0.6, 0.7, 0.8, 0.9, 0.4, 0.3, 0.5, 0.2, 0.75, 0.0, 0.1];
         let (output, activations) = net.forward_with_cache(&input);
 
         assert_eq!(output.len(), 2);

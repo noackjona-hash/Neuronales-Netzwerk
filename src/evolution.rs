@@ -1,6 +1,6 @@
 //! Genetic Algorithm and Population Evolution engine built from scratch.
-//! Handles agent lifecycle, fitness evaluation, elitism, multi-mode selection,
-//! crossover, Gaussian mutation, and historical fitness tracking.
+//! Features Adaptive Hypermutation, Stagnation Detection, Novelty Injection (Random Immigrants),
+//! Elitism, and Multi-Mode Parent Selection to escape local minima and prevent premature convergence.
 
 #![allow(dead_code)]
 
@@ -20,28 +20,30 @@ pub enum SelectionMethod {
     RankBased,
 }
 
-/// Evolution Hyperparameters.
+/// Evolution Hyperparameters with dynamic adaptive mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionConfig {
     pub population_size: usize,
-    pub elitism_count: usize,       // Top N agents preserved without modification
-    pub mutation_rate: f32,         // Probability of mutating each weight/bias
-    pub mutation_strength: f32,     // Standard deviation of Gaussian noise
-    pub tournament_size: usize,     // Number of candidates in tournament selection
+    pub elitism_count: usize,       // Top N agents preserved untouched
+    pub base_mutation_rate: f32,    // Base probability of mutating each weight
+    pub base_mutation_strength: f32,// Base Gaussian standard deviation
+    pub tournament_size: usize,     // Tournament candidates
     pub selection_method: SelectionMethod,
-    pub max_generation_time: f32,   // Maximum seconds per generation before forcing next gen
+    pub max_generation_time: f32,   // Maximum seconds per generation
+    pub novelty_ratio: f32,         // Ratio of population reserved for fresh random explorers (e.g. 0.15)
 }
 
 impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
-            population_size: 60,
+            population_size: 70,
             elitism_count: 5,
-            mutation_rate: 0.10,
-            mutation_strength: 0.26,
+            base_mutation_rate: 0.09,
+            base_mutation_strength: 0.24,
             tournament_size: 4,
             selection_method: SelectionMethod::Tournament,
             max_generation_time: 45.0,
+            novelty_ratio: 0.15,
         }
     }
 }
@@ -54,6 +56,7 @@ pub struct Agent {
     pub brain: NeuralNetwork,
     pub fitness: f32,
     pub is_elite: bool,
+    pub is_novelty_immigrant: bool,
     pub color_rgba: [u8; 4],
 }
 
@@ -68,47 +71,37 @@ impl Agent {
             brain,
             fitness: 0.0,
             is_elite: false,
+            is_novelty_immigrant: false,
             color_rgba: [r, g, b, 230],
         }
     }
 
-    /// Step agent forward: read 11 telemetry & sensor inputs -> compute deep brain -> apply car controls -> integrate physics.
+    /// Step agent forward: read 12 telemetry inputs -> compute deep brain -> apply car controls -> integrate physics.
     pub fn step(&mut self, dt: f32, track: &Track) {
         if !self.car.is_alive {
             return;
         }
 
-        // 1. Get 11 telemetry and raycast inputs
         let inputs = self.car.get_network_inputs();
-
-        // 2. Feedforward deep neural network
         let outputs = self.brain.forward(&inputs);
 
-        // 3. Map network outputs:
         // Output 0: Steering in [-1.0, 1.0]
         let steer = outputs[0].clamp(-1.0, 1.0);
 
         // Output 1: Throttle & Brake
         let gas_brake = outputs[1];
         let (throttle, brake) = if gas_brake >= 0.0 {
-            // Smooth throttle mapping
             (0.15 + 0.85 * gas_brake.clamp(0.0, 1.0), 0.0)
         } else {
-            // Brake mapping
             (0.0, (-gas_brake).clamp(0.0, 1.0))
         };
 
         self.car.apply_controls(steer, throttle, brake);
-
-        // 4. Update car physics, collisions, and checkpoints
         self.car.update(dt, track);
-
-        // 5. Update agent fitness from car
         self.fitness = self.car.fitness;
     }
 }
 
-/// Helper function: Convert HSV to RGB.
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
@@ -147,9 +140,11 @@ pub struct GenerationStats {
     pub death_wall_count: usize,
     pub death_timeout_count: usize,
     pub death_wrongway_count: usize,
+    pub stagnant_generations: usize,
+    pub mutation_temperature: f32,
 }
 
-/// The evolutionary population manager.
+/// The evolutionary population manager with anti-stagnation mechanisms.
 pub struct Population {
     pub config: EvolutionConfig,
     pub agents: Vec<Agent>,
@@ -162,10 +157,13 @@ pub struct Population {
     pub best_ever_brain: Option<NeuralNetwork>,
     pub best_current_agent_idx: usize,
     pub stats_history: Vec<GenerationStats>,
+
+    // Stagnation & Adaptive Mutation Engine
+    pub stagnant_generations: usize,
+    pub mutation_temperature: f32, // Multiplier for mutation strength (1.0 = normal, 3.0+ = heat burst)
 }
 
 impl Population {
-    /// Initialize a new population with randomized deep neural network brains.
     pub fn new(config: EvolutionConfig, track: &Track, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut agents = Vec::with_capacity(config.population_size);
@@ -185,15 +183,15 @@ impl Population {
             best_ever_brain: None,
             best_current_agent_idx: 0,
             stats_history: Vec::new(),
+            stagnant_generations: 0,
+            mutation_temperature: 1.0,
         }
     }
 
-    /// Number of agents currently alive and racing.
     pub fn alive_count(&self) -> usize {
         self.agents.iter().filter(|a| a.car.is_alive).count()
     }
 
-    /// Best fitness in the current generation.
     pub fn current_best_fitness(&self) -> f32 {
         self.agents
             .iter()
@@ -201,7 +199,6 @@ impl Population {
             .fold(0.0f32, |acc, f| acc.max(f))
     }
 
-    /// Index of the leader / best performing agent in current generation.
     pub fn leader_idx(&self) -> usize {
         let mut best_idx = 0;
         let mut best_fit = -1.0f32;
@@ -216,7 +213,6 @@ impl Population {
         best_idx
     }
 
-    /// Step all agents forward by `dt` seconds.
     pub fn step(&mut self, dt: f32, track: &Track) {
         self.generation_time += dt;
 
@@ -229,12 +225,11 @@ impl Population {
         self.best_current_agent_idx = self.leader_idx();
     }
 
-    /// Check if current generation has concluded (all cars crashed or timeout reached).
     pub fn is_generation_over(&self) -> bool {
         self.alive_count() == 0 || self.generation_time >= self.config.max_generation_time
     }
 
-    /// Advance to the next generation via Elitism, Selection, Crossover, and Mutation.
+    /// Advance to the next generation with Adaptive Hypermutation & Novelty Injection.
     pub fn advance_generation(&mut self, track: &Track) {
         // 1. Sort agents descending by fitness
         self.agents
@@ -242,7 +237,7 @@ impl Population {
 
         let gen_best_fitness = self.agents[0].fitness;
         let sum_fitness: f32 = self.agents.iter().map(|a| a.fitness).sum();
-        let avg_fitness = sum_fitness / self.agents.len() as f32;
+        let avg_fitness = sum_fitness / self.agents.len().max(1) as f32;
 
         let max_checkpoints = self.agents.iter().map(|a| a.car.checkpoints_hit).max().unwrap_or(0);
         let max_laps = self.agents.iter().map(|a| a.car.laps_completed).max().unwrap_or(0);
@@ -251,6 +246,20 @@ impl Population {
             .iter()
             .map(|a| a.car.top_speed_recorded)
             .fold(0.0f32, |acc, s| acc.max(s));
+
+        // 2. Check for Improvement or Stagnation
+        let is_new_record = gen_best_fitness > self.best_ever_fitness + 50.0;
+        if is_new_record {
+            self.best_ever_fitness = gen_best_fitness;
+            self.best_ever_brain = Some(self.agents[0].brain.clone());
+            self.stagnant_generations = 0;
+            self.mutation_temperature = 1.0; // Cool down to fine-tune
+        } else {
+            self.stagnant_generations += 1;
+            // Adaptive Temperature Ramp: exponentially scale mutation if stuck
+            let heat_factor = 1.0 + (self.stagnant_generations as f32 * 0.12).min(4.0);
+            self.mutation_temperature = heat_factor;
+        }
 
         let mut death_wall = 0;
         let mut death_timeout = 0;
@@ -276,18 +285,20 @@ impl Population {
             death_wall_count: death_wall,
             death_timeout_count: death_timeout,
             death_wrongway_count: death_wrongway,
+            stagnant_generations: self.stagnant_generations,
+            mutation_temperature: self.mutation_temperature,
         });
 
-        // Update all-time best brain
-        if gen_best_fitness > self.best_ever_fitness || self.best_ever_brain.is_none() {
-            self.best_ever_fitness = gen_best_fitness;
-            self.best_ever_brain = Some(self.agents[0].brain.clone());
-        }
+        // 3. Compute Adaptive Mutation Hyperparameters
+        let effective_mutation_rate = (self.config.base_mutation_rate * (1.0 + self.stagnant_generations as f32 * 0.04))
+            .clamp(0.08, 0.40);
+        let effective_mutation_strength = (self.config.base_mutation_strength * self.mutation_temperature)
+            .clamp(0.20, 1.20);
 
-        // 2. Prepare new generation agents
+        // 4. Construct Next Generation
         let mut new_agents = Vec::with_capacity(self.config.population_size);
 
-        // A. Elitism: preserve top N performers unchanged
+        // A. Elitism: Keep Top N Champions intact
         let num_elites = self.config.elitism_count.min(self.agents.len());
         for i in 0..num_elites {
             let mut elite_agent = Agent::new(
@@ -301,7 +312,34 @@ impl Population {
             new_agents.push(elite_agent);
         }
 
-        // B. Reproduction: Selection + Crossover + Mutation
+        // B. Champion Exploratory Variants (5% of population)
+        if let Some(champ) = &self.best_ever_brain {
+            let champ_variants = ((self.config.population_size as f32) * 0.08).round() as usize;
+            for _ in 0..champ_variants {
+                if new_agents.len() >= self.config.population_size { break; }
+                let mut variant = champ.clone();
+                // Mutate with higher strength
+                variant.mutate(effective_mutation_rate * 1.5, effective_mutation_strength * 1.3, &mut self.rng);
+                let id = new_agents.len();
+                let mut agent = Agent::new(id, track.start_position, track.start_angle, variant);
+                agent.color_rgba = [0, 255, 200, 240]; // Cyan aura
+                new_agents.push(agent);
+            }
+        }
+
+        // C. Novelty Random Immigrants (15% of population) to inject fresh genetic lineages
+        let num_novelty = ((self.config.population_size as f32) * self.config.novelty_ratio).round() as usize;
+        for _ in 0..num_novelty {
+            if new_agents.len() >= self.config.population_size { break; }
+            let fresh_brain = NeuralNetwork::default_car_brain(&mut self.rng);
+            let id = new_agents.len();
+            let mut agent = Agent::new(id, track.start_position, track.start_angle, fresh_brain);
+            agent.is_novelty_immigrant = true;
+            agent.color_rgba = [255, 105, 180, 240]; // Pink/purple aura
+            new_agents.push(agent);
+        }
+
+        // D. Main Population: Tournament Selection + Crossover + Adaptive Mutation
         while new_agents.len() < self.config.population_size {
             let idx_a = select_parent_idx(
                 &self.agents,
@@ -316,14 +354,12 @@ impl Population {
                 &mut self.rng,
             );
 
-            // Crossover
             let mut child_brain =
                 NeuralNetwork::crossover(&self.agents[idx_a].brain, &self.agents[idx_b].brain, &mut self.rng);
 
-            // Mutation
             child_brain.mutate(
-                self.config.mutation_rate,
-                self.config.mutation_strength,
+                effective_mutation_rate,
+                effective_mutation_strength,
                 &mut self.rng,
             );
 
@@ -336,39 +372,44 @@ impl Population {
             ));
         }
 
-        // 3. Install new generation
+        // 5. Install new generation
         self.agents = new_agents;
         self.generation += 1;
         self.generation_time = 0.0;
         self.best_current_agent_idx = 0;
     }
 
-    /// Reset population to initial start for a new track.
     pub fn reset_to_track(&mut self, track: &Track) {
         self.generation = 1;
         self.generation_time = 0.0;
+        self.stagnant_generations = 0;
+        self.mutation_temperature = 1.0;
         self.stats_history.clear();
 
         for (i, agent) in self.agents.iter_mut().enumerate() {
             agent.car.reset(track.start_position, track.start_angle);
             agent.fitness = 0.0;
             agent.is_elite = false;
+            agent.is_novelty_immigrant = false;
             let hue = (i as f32 * 137.5) % 360.0;
             let (r, g, b) = hsv_to_rgb(hue, 0.85, 0.95);
             agent.color_rgba = [r, g, b, 230];
         }
     }
 
-    /// Load a pre-trained brain and clone it into the population with mutations.
     pub fn inject_champion_brain(&mut self, brain: NeuralNetwork, track: &Track) {
         self.best_ever_brain = Some(brain.clone());
+        self.best_ever_fitness = 0.0;
+        self.stagnant_generations = 0;
+        self.mutation_temperature = 1.0;
+
         self.agents[0] = Agent::new(0, track.start_position, track.start_angle, brain.clone());
         self.agents[0].is_elite = true;
         self.agents[0].color_rgba = [255, 215, 0, 255];
 
         for i in 1..self.agents.len() {
             let mut mutated = brain.clone();
-            mutated.mutate(self.config.mutation_rate, self.config.mutation_strength, &mut self.rng);
+            mutated.mutate(self.config.base_mutation_rate, self.config.base_mutation_strength, &mut self.rng);
             self.agents[i] = Agent::new(i, track.start_position, track.start_angle, mutated);
         }
 
@@ -376,7 +417,6 @@ impl Population {
     }
 }
 
-/// Helper function to select parent index without conflicting borrows.
 fn select_parent_idx(
     agents: &[Agent],
     method: SelectionMethod,
@@ -426,5 +466,32 @@ fn select_parent_idx(
             }
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_population_advance() {
+        let track = Track::preset_grand_prix();
+        let config = EvolutionConfig {
+            population_size: 20,
+            elitism_count: 2,
+            ..Default::default()
+        };
+        let mut pop = Population::new(config, &track, 42);
+        assert_eq!(pop.agents.len(), 20);
+        assert_eq!(pop.generation, 1);
+
+        for _ in 0..10 {
+            pop.step(0.016, &track);
+        }
+
+        pop.advance_generation(&track);
+        assert_eq!(pop.generation, 2);
+        assert_eq!(pop.agents.len(), 20);
+        assert_eq!(pop.stats_history.len(), 1);
     }
 }
