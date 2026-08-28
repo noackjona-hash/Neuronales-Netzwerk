@@ -46,7 +46,6 @@ pub struct AppState {
     pub show_graph: bool,
     pub show_help: bool,
     pub show_sensors: bool,
-    pub is_fullscreen: bool,
     pub skid_marks: Vec<SkidSegment>,
     pub toast_message: Option<(String, f32)>, // message, display timer
 }
@@ -57,7 +56,7 @@ fn window_conf() -> Conf {
         window_width: 1280,
         window_height: 720,
         window_resizable: true,
-        high_dpi: true,
+        high_dpi: false, // Prevents Wayland/X11 GL buffer mismatch crash on resize/maximize
         fullscreen: false,
         ..Default::default()
     }
@@ -162,9 +161,8 @@ fn init_app_state() -> AppState {
         show_graph: true,
         show_help: false,
         show_sensors: true,
-        is_fullscreen: false,
         skid_marks: Vec::with_capacity(2048),
-        toast_message: Some(("NeuroRacer: Realistic 2D Physics & Deep Neural Evolution! [H] for controls.".to_string(), 4.5)),
+        toast_message: Some(("NeuroRacer: Deep Neural Network & Realistic Physics! [H] for controls.".to_string(), 4.5)),
     }
 }
 
@@ -205,17 +203,6 @@ fn fade_skid_marks(state: &mut AppState, dt: f32) {
 }
 
 fn handle_input(state: &mut AppState) {
-    // Fullscreen Toggle (F11 or F)
-    if is_key_pressed(KeyCode::F11) || is_key_pressed(KeyCode::F) {
-        state.is_fullscreen = !state.is_fullscreen;
-        // Safely request fullscreen toggle in macroquad
-        macroquad::window::set_fullscreen(state.is_fullscreen);
-        state.toast_message = Some((
-            if state.is_fullscreen { "Entered Fullscreen Mode".to_string() } else { "Exited Fullscreen Mode".to_string() },
-            2.0,
-        ));
-    }
-
     // Space: Pause/Resume
     if is_key_pressed(KeyCode::Space) {
         state.paused = !state.paused;
@@ -355,7 +342,8 @@ fn handle_input(state: &mut AppState) {
     if is_mouse_button_down(MouseButton::Right) || is_mouse_button_down(MouseButton::Middle) {
         let delta = cur_mouse - state.last_mouse_pos;
         state.camera_mode = CameraMode::FreePan;
-        state.cam_pos -= delta / state.cam_zoom.max(0.1);
+        let zoom_val = state.cam_zoom.max(0.1);
+        state.cam_pos -= delta / zoom_val;
         state.cam_target = state.cam_pos;
     }
     state.last_mouse_pos = cur_mouse;
@@ -444,7 +432,6 @@ fn draw_world(state: &AppState) {
     let scr_w = screen_width().max(320.0);
     let scr_h = screen_height().max(240.0);
 
-    // Camera setup with division-by-zero protection
     let zoom_factor_x = (2.0 / scr_w) * state.cam_zoom;
     let zoom_factor_y = -(2.0 / scr_h) * state.cam_zoom;
 
@@ -618,7 +605,6 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool) {
     let wheel_w = 4.0;
     let wheel_l = 8.0;
 
-    // Front wheels (physically steer with car.steer_angle)
     let front_axle_pos = car.position + fwd * (car.config.dist_cg_front * 10.0);
     let front_steer_dir = Vec2::from_angle(car.heading_angle + car.steer_angle);
     let front_steer_right = front_steer_dir.perpendicular();
@@ -629,7 +615,6 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool) {
     draw_wheel(fl_wheel, front_steer_dir, front_steer_right, wheel_l, wheel_w);
     draw_wheel(fr_wheel, front_steer_dir, front_steer_right, wheel_l, wheel_w);
 
-    // Rear wheels
     let rear_axle_pos = car.position - fwd * (car.config.dist_cg_rear * 10.0);
     let rl_wheel = rear_axle_pos - right * (car.config.width * 0.52);
     let rr_wheel = rear_axle_pos + right * (car.config.width * 0.52);
@@ -751,7 +736,7 @@ fn draw_hud(state: &AppState) {
     let scr_w = screen_width().max(320.0);
     let scr_h = screen_height().max(240.0);
 
-    // 1. Top Dashboard Banner (Safely responsive)
+    // 1. Top Dashboard Banner
     draw_rectangle(0.0, 0.0, scr_w, 54.0, Color::new(0.06, 0.08, 0.11, 0.94));
     draw_line(0.0, 54.0, scr_w, 54.0, 1.5, Color::new(0.2, 0.25, 0.35, 0.8));
 
@@ -762,7 +747,7 @@ fn draw_hud(state: &AppState) {
     let best_fit = state.population.current_best_fitness();
     let record_fit = state.population.best_ever_fitness;
 
-    let font_size = 19.0;
+    let font_size = 18.0;
     let y_text = 33.0;
 
     // Title / Logo
@@ -819,7 +804,7 @@ fn draw_hud(state: &AppState) {
     if state.show_help {
         draw_help_overlay(scr_w, scr_h);
     } else {
-        draw_text("[H] Controls  [F11] Fullscreen", 18.0, scr_h - 10.0, 15.0, Color::new(0.5, 0.6, 0.7, 0.8));
+        draw_text("[H] Controls  [M] Manual Drive", 18.0, scr_h - 10.0, 15.0, Color::new(0.5, 0.6, 0.7, 0.8));
     }
 }
 
@@ -983,7 +968,6 @@ fn draw_help_overlay(scr_w: f32, scr_h: f32) {
     draw_text("SIMULATION CONTROLS & SHORTCUTS", px + 25.0, py + 35.0, 20.0, Color::new(0.2, 0.85, 1.0, 1.0));
 
     let items = [
-        ("[F11] / [F]", "Toggle Fullscreen Mode"),
         ("[Space]", "Pause / Resume simulation"),
         ("[1] - [6]", "Simulation Speed (1x, 2x, 5x, 10x, 25x, 50x)"),
         ("[T]", "Cycle Track Presets (Monaco, Speedway, Hairpin, Figure-8, Procedural)"),
@@ -1005,6 +989,6 @@ fn draw_help_overlay(scr_w: f32, scr_h: f32) {
     for (key, desc) in items {
         draw_text(key, px + 25.0, cur_y, 15.0, Color::new(1.0, 0.85, 0.2, 1.0));
         draw_text(desc, px + 155.0, cur_y, 15.0, Color::new(0.85, 0.9, 0.95, 0.9));
-        cur_y += 20.5;
+        cur_y += 22.0;
     }
 }
