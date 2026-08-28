@@ -49,6 +49,10 @@ pub struct AppState {
     pub show_sensors: bool,
     pub skid_marks: Vec<SkidSegment>,
     pub toast_message: Option<(String, f32)>,
+    
+    // Autosave & Perfection
+    pub autosave_timer: f32,
+    pub training_completed_modal: bool,
 }
 
 fn window_conf() -> Conf {
@@ -71,7 +75,7 @@ async fn main() {
     loop {
         let frame_dt = get_frame_time().clamp(0.001, 0.1);
 
-        // Handle Toast notifications
+        // 1. Handle Toast notifications
         if let Some((_, timer)) = &mut state.toast_message {
             *timer -= frame_dt;
             if *timer <= 0.0 {
@@ -79,26 +83,46 @@ async fn main() {
             }
         }
 
-        // Process User Inputs & Hotkeys
+        // 2. 10-Second Autosave System
+        state.autosave_timer -= frame_dt;
+        if state.autosave_timer <= 0.0 {
+            state.autosave_timer = 10.0;
+            perform_autosave(&mut state);
+        }
+
+        // 3. Process User Inputs & Hotkeys
         handle_input(&mut state);
 
-        // Simulation Physics Step (with speed multiplier & turbo mode)
+        // 4. Simulation Physics Step (with speed multiplier & turbo mode)
         if !state.paused {
             let steps = if state.turbo_mode { 250 } else { state.sim_speed };
             for _ in 0..steps {
                 state.population.step(dt_fixed, &state.track);
 
-                // Collect skid marks only in normal rendering speeds to keep 1000x smooth
                 if !state.turbo_mode && state.sim_speed <= 50 {
                     collect_skid_marks(&mut state);
                 }
 
-                // Step Manual Player Car if active
                 if state.manual_drive {
                     if let Some(player) = &mut state.player_car {
                         handle_player_drive(player);
                         player.update(dt_fixed, &state.track);
                     }
+                }
+
+                // Check Perfection Termination Criteria
+                if state.population.is_perfectly_trained && !state.training_completed_modal {
+                    state.training_completed_modal = true;
+                    state.paused = true;
+                    state.turbo_mode = false;
+                    perform_autosave(&mut state);
+                    if let Some(brain) = &state.population.best_ever_brain {
+                        if let Ok(json) = brain.to_json() {
+                            let _ = std::fs::write("champion_perfect_nn.json", json);
+                        }
+                    }
+                    state.toast_message = Some(("🏆 TRACK MASTERED: Training Complete! Brain saved.".to_string(), 6.0));
+                    break;
                 }
 
                 // Check Generation Conclusion
@@ -111,19 +135,13 @@ async fn main() {
             }
         }
 
-        // Decay skid marks
         fade_skid_marks(&mut state, frame_dt);
-
-        // Update Camera smoothly
         update_camera(&mut state, frame_dt);
 
-        // Render Frame safely
         clear_background(Color::new(0.07, 0.09, 0.12, 1.0));
 
-        // 1. World Space Rendering
+        // Render World & UI
         draw_world(&state);
-
-        // 2. Screen Space HUD & UI Overlay
         draw_hud(&state);
 
         next_frame().await;
@@ -140,6 +158,7 @@ fn init_app_state() -> AppState {
         tournament_size: 4,
         max_generation_time: 45.0,
         novelty_ratio: 0.15,
+        target_laps_for_perfection: 3,
         ..Default::default()
     };
 
@@ -166,7 +185,19 @@ fn init_app_state() -> AppState {
         show_help: false,
         show_sensors: true,
         skid_marks: Vec::with_capacity(2048),
-        toast_message: Some(("NeuroRacer: Speeds up to 1000x! [Tab] for Turbo Mode.".to_string(), 4.5)),
+        toast_message: Some(("NeuroRacer: Autosave every 10s & Auto-Completion active! [H] Help".to_string(), 4.5)),
+        autosave_timer: 10.0,
+        training_completed_modal: false,
+    }
+}
+
+fn perform_autosave(state: &mut AppState) {
+    if let Some(brain) = &state.population.best_ever_brain {
+        if let Ok(json) = brain.to_json() {
+            if std::fs::write("best_car_nn.json", json).is_ok() {
+                // Autosave succeeded silently or with indicator
+            }
+        }
     }
 }
 
@@ -210,9 +241,12 @@ fn handle_input(state: &mut AppState) {
     // Space: Pause/Resume
     if is_key_pressed(KeyCode::Space) {
         state.paused = !state.paused;
+        if state.training_completed_modal {
+            state.training_completed_modal = false;
+        }
     }
 
-    // Number keys: Ultra-Wide Simulation Speeds from 1x to 1000x
+    // Number keys: Simulation Speeds (1x to 1000x)
     if is_key_pressed(KeyCode::Key1) {
         state.sim_speed = 1;
         state.turbo_mode = false;
@@ -254,7 +288,7 @@ fn handle_input(state: &mut AppState) {
         state.turbo_mode = false;
     }
 
-    // Tab / B: Turbo Training Mode (Ultra Fast-Forward)
+    // Tab / B: Turbo Training Mode
     if is_key_pressed(KeyCode::Tab) || is_key_pressed(KeyCode::B) {
         state.turbo_mode = !state.turbo_mode;
         if state.turbo_mode {
@@ -279,6 +313,7 @@ fn handle_input(state: &mut AppState) {
         };
         state.population.reset_to_track(&state.track);
         state.skid_marks.clear();
+        state.training_completed_modal = false;
         if let Some(player) = &mut state.player_car {
             player.reset(state.track.start_position, state.track.start_angle);
         }
@@ -347,18 +382,14 @@ fn handle_input(state: &mut AppState) {
     if is_key_pressed(KeyCode::R) {
         state.population.reset_to_track(&state.track);
         state.skid_marks.clear();
+        state.training_completed_modal = false;
         state.toast_message = Some(("Reset simulation to Generation 1".to_string(), 2.0));
     }
 
     // S: Save best brain
     if is_key_pressed(KeyCode::S) {
-        if let Some(brain) = &state.population.best_ever_brain {
-            if let Ok(json) = brain.to_json() {
-                if std::fs::write("best_car_nn.json", json).is_ok() {
-                    state.toast_message = Some(("Saved deep champion brain to best_car_nn.json!".to_string(), 3.0));
-                }
-            }
-        }
+        perform_autosave(state);
+        state.toast_message = Some(("Saved deep champion brain to best_car_nn.json!".to_string(), 3.0));
     }
 
     // L: Load best brain
@@ -366,6 +397,7 @@ fn handle_input(state: &mut AppState) {
         if let Ok(json) = std::fs::read_to_string("best_car_nn.json") {
             if let Ok(brain) = NeuralNetwork::from_json(&json) {
                 state.population.inject_champion_brain(brain, &state.track);
+                state.training_completed_modal = false;
                 state.toast_message = Some(("Loaded champion brain from best_car_nn.json!".to_string(), 3.0));
             }
         } else {
@@ -852,12 +884,65 @@ fn draw_hud(state: &AppState) {
         draw_text(msg, px + 15.0, py + 23.0, 20.0, Color::new(0.9, 0.95, 1.0, 1.0));
     }
 
-    // 5. Help Overlay Window (if toggled)
+    // 5. Training Completed / Perfection Modal
+    if state.training_completed_modal {
+        draw_victory_modal(scr_w, scr_h, state);
+    }
+
+    // 6. Help Overlay Window
     if state.show_help {
         draw_help_overlay(scr_w, scr_h);
-    } else {
-        draw_text("[H] Controls  [Tab] Turbo Warp Train", 18.0, scr_h - 10.0, 15.0, Color::new(0.5, 0.6, 0.7, 0.8));
+    } else if !state.training_completed_modal {
+        let save_sec = state.autosave_timer.ceil() as u32;
+        draw_text(
+            &format!("[H] Controls  [Tab] Turbo  💾 AutoSave in {}s", save_sec),
+            18.0,
+            scr_h - 10.0,
+            14.0,
+            Color::new(0.5, 0.6, 0.7, 0.85),
+        );
     }
+}
+
+fn draw_victory_modal(scr_w: f32, scr_h: f32, state: &AppState) {
+    let pw = 580.0f32.min(scr_w - 40.0);
+    let ph = 340.0f32.min(scr_h - 40.0);
+    let px = (scr_w - pw) * 0.5;
+    let py = (scr_h - ph) * 0.5;
+
+    // Dark backdrop overlay
+    draw_rectangle(0.0, 0.0, scr_w, scr_h, Color::new(0.0, 0.0, 0.0, 0.65));
+
+    // Modal box
+    draw_rectangle(px, py, pw, ph, Color::new(0.05, 0.08, 0.12, 0.98));
+    draw_rectangle_lines(px, py, pw, ph, 2.5, Color::new(1.0, 0.84, 0.0, 0.95));
+
+    draw_text("🏆 TRAINING COMPLETE: TRACK MASTERED!", px + 30.0, py + 40.0, 22.0, Color::new(1.0, 0.85, 0.1, 1.0));
+    draw_text(
+        "The neural network achieved 3 consecutive flawless laps with 0 wall collisions!",
+        px + 30.0,
+        py + 75.0,
+        15.0,
+        Color::new(0.85, 0.9, 0.95, 0.9),
+    );
+
+    // Summary telemetry stats
+    let gen = state.population.generation;
+    let best_fit = state.population.best_ever_fitness;
+    let top_spd = state.population.agents.iter().map(|a| a.car.top_speed_recorded).fold(0.0f32, |acc, s| acc.max(s));
+
+    draw_rectangle(px + 30.0, py + 105.0, pw - 60.0, 110.0, Color::new(0.09, 0.13, 0.19, 0.9));
+    draw_rectangle_lines(px + 30.0, py + 105.0, pw - 60.0, 110.0, 1.0, Color::new(0.2, 0.4, 0.6, 0.8));
+
+    draw_text(&format!("• Circuit: {}", state.track.name), px + 45.0, py + 130.0, 16.0, WHITE);
+    draw_text(&format!("• Completed in Generation: {}", gen), px + 45.0, py + 155.0, 16.0, Color::new(0.3, 0.9, 0.4, 1.0));
+    draw_text(&format!("• Champion Record Fitness: {:.0}", best_fit), px + 45.0, py + 180.0, 16.0, Color::new(1.0, 0.85, 0.2, 1.0));
+    draw_text(&format!("• Top Speed: {:.1} km/h", top_spd), px + 45.0, py + 205.0, 16.0, Color::new(0.2, 0.85, 1.0, 1.0));
+
+    draw_text("💾 Champion brain saved to: champion_perfect_nn.json & best_car_nn.json", px + 30.0, py + 240.0, 13.0, Color::new(0.4, 1.0, 0.6, 0.95));
+
+    // Next steps
+    draw_text("[Space] Watch Champion Drive   [T] Next Track   [M] Race Against AI", px + 30.0, py + 290.0, 15.0, Color::new(1.0, 0.85, 0.2, 1.0));
 }
 
 fn draw_deep_neural_network_hud(agent: &evolution::Agent, x: f32, y: f32, w: f32, h: f32) {
@@ -897,7 +982,7 @@ fn draw_deep_neural_network_hud(agent: &evolution::Agent, x: f32, y: f32, w: f32
         y + 30.0 + (node_idx + 1) as f32 * spacing
     };
 
-    // 1. Draw Synaptic Weights (Lines between layers)
+    // 1. Draw Synaptic Weights
     for l in 0..agent.brain.layers.len() {
         let layer = &agent.brain.layers[l];
         let in_count = layer.in_features;
@@ -1019,7 +1104,7 @@ fn draw_help_overlay(scr_w: f32, scr_h: f32) {
     let items = [
         ("[Space]", "Pause / Resume simulation"),
         ("[1] - [0]", "Simulation Speed: 1x, 2x, 5x, 10x, 25x, 50x, 100x, 250x, 500x, 1000x!"),
-        ("[Tab] / [B]", "⚡ TURBO TRAINING: Maximum CPU training rate (50 gens in seconds)"),
+        ("[Tab] / [B]", "⚡ TURBO TRAINING: Maximum CPU training rate"),
         ("[T]", "Cycle Track Presets (Monaco, Speedway, Hairpin, Figure-8, Procedural)"),
         ("[C]", "Cycle Camera (Follow Best <-> Track Overview <-> Free Pan)"),
         ("[Right Click Drag]", "Free Pan Camera across racetrack"),
