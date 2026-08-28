@@ -1,5 +1,6 @@
-//! 2D Top-down arcade/semi-realistic car physics, raycast sensor array,
-//! collision detection, checkpoint progression, and fitness evaluation.
+//! Realistic 2D Vehicle Dynamics (Bicycle / Two-Track Model with Tire Slip Angles,
+//! Lateral Grip Saturation, Weight Transfer, and Skid Mark Generation),
+//! Raycast Sensor Array, OBB Collision Detection, and Fitness Progression.
 
 #![allow(dead_code)]
 
@@ -16,22 +17,36 @@ pub enum DeathReason {
     WrongWay,
 }
 
-/// Car configuration constants.
+/// Vehicle Physical Parameters (based on real-world sports car dynamics).
 #[derive(Debug, Clone, Copy)]
 pub struct CarConfig {
-    pub length: f32,
-    pub width: f32,
-    pub max_forward_speed: f32,
-    pub max_reverse_speed: f32,
-    pub acceleration_rate: f32,
-    pub braking_rate: f32,
-    pub steer_speed: f32,
-    pub max_steer_angle: f32,
-    pub drag_coeff: f32,
-    pub lateral_grip: f32,
+    // Physical dimensions & mass
+    pub length: f32,          // Visual length (pixels/units)
+    pub width: f32,           // Visual width (pixels/units)
+    pub mass: f32,            // Mass (kg)
+    pub inertia: f32,         // Yaw moment of inertia Iz (kg*m^2)
+    pub dist_cg_front: f32,   // Distance from CG to front axle (m)
+    pub dist_cg_rear: f32,    // Distance from CG to rear axle (m)
+    pub cg_height: f32,       // CG height for dynamic weight transfer (m)
+    
+    // Tires & Cornering
+    pub cornering_stiffness_front: f32, // Front tire cornering stiffness (N/rad)
+    pub cornering_stiffness_rear: f32,  // Rear tire cornering stiffness (N/rad)
+    pub friction_coeff: f32,            // Peak tire friction coefficient (mu)
+    
+    // Drivetrain & Aerodynamics
+    pub max_engine_force: f32,          // Maximum forward propulsion force (N)
+    pub max_brake_force: f32,           // Maximum braking force (N)
+    pub max_reverse_force: f32,         // Maximum reverse force (N)
+    pub max_steer_angle: f32,           // Maximum wheel steering angle (radians)
+    pub steer_speed: f32,               // Steering actuator speed (rad/s)
+    pub drag_coeff: f32,                // Aerodynamic drag coefficient
+    pub rolling_resistance: f32,        // Rolling resistance coefficient
+    
+    // Sensors & Rules
     pub ray_sensor_range: f32,
     pub ray_sensor_angles: [f32; 7],
-    pub checkpoint_timeout: f32, // Seconds before timeout if no new checkpoint is reached
+    pub checkpoint_timeout: f32,        // Seconds before timeout
 }
 
 impl Default for CarConfig {
@@ -39,14 +54,21 @@ impl Default for CarConfig {
         Self {
             length: 32.0,
             width: 16.0,
-            max_forward_speed: 620.0,
-            max_reverse_speed: 120.0,
-            acceleration_rate: 450.0,
-            braking_rate: 650.0,
-            steer_speed: 3.8,
-            max_steer_angle: 0.55, // ~31.5 degrees
-            drag_coeff: 0.0008,
-            lateral_grip: 0.88, // 0.88 lateral velocity damping per step (allows controlled drift)
+            mass: 1100.0,
+            inertia: 1750.0,
+            dist_cg_front: 1.25,
+            dist_cg_rear: 1.35,
+            cg_height: 0.45,
+            cornering_stiffness_front: 45000.0,
+            cornering_stiffness_rear: 52000.0,
+            friction_coeff: 1.15,
+            max_engine_force: 7200.0,
+            max_brake_force: 11000.0,
+            max_reverse_force: 3500.0,
+            max_steer_angle: 0.58, // ~33.2 degrees
+            steer_speed: 6.5,
+            drag_coeff: 0.38,
+            rolling_resistance: 12.0,
             ray_sensor_range: 280.0,
             ray_sensor_angles: [
                 -75.0 * PI / 180.0,
@@ -62,17 +84,37 @@ impl Default for CarConfig {
     }
 }
 
-/// 2D Car instance.
+/// A persistent skid mark on the track.
+#[derive(Debug, Clone, Copy)]
+pub struct SkidMark {
+    pub start: Vec2,
+    pub end: Vec2,
+    pub alpha: f32,
+}
+
+/// 2D Realistic Physics Car.
 #[derive(Debug, Clone)]
 pub struct Car {
     pub config: CarConfig,
     pub position: Vec2,
-    pub velocity: Vec2,
-    pub heading_angle: f32, // Heading in radians
-    pub angular_velocity: f32,
-    pub steer_input: f32,    // [-1.0, 1.0]
-    pub throttle_input: f32, // [0.0, 1.0]
-    pub brake_input: f32,    // [0.0, 1.0]
+    
+    // Body state in local & world coordinates
+    pub heading_angle: f32,     // Yaw orientation (rad)
+    pub velocity_local: Vec2,   // (u = longitudinal forward, v = lateral sideways)
+    pub yaw_rate: f32,          // Angular velocity omega (rad/s)
+    pub steer_angle: f32,       // Current front wheel steering angle (rad)
+    
+    // Control inputs
+    pub steer_input: f32,       // [-1.0, 1.0]
+    pub throttle_input: f32,    // [0.0, 1.0]
+    pub brake_input: f32,       // [0.0, 1.0]
+
+    // Realistic physics telemetry
+    pub slip_angle_front: f32,
+    pub slip_angle_rear: f32,
+    pub lateral_force_front: f32,
+    pub lateral_force_rear: f32,
+    pub is_skidding: bool,
 
     // Sensors
     pub sensor_readings: [f32; 7], // Normalized [0.0, 1.0]
@@ -92,22 +134,26 @@ pub struct Car {
 }
 
 impl Car {
-    /// Create a new car placed at track start position and heading.
     pub fn new(position: Vec2, heading_angle: f32) -> Self {
         Self::with_config(position, heading_angle, CarConfig::default())
     }
 
-    /// Create car with custom configuration.
     pub fn with_config(position: Vec2, heading_angle: f32, config: CarConfig) -> Self {
         Self {
             config,
             position,
-            velocity: Vec2::ZERO,
             heading_angle,
-            angular_velocity: 0.0,
+            velocity_local: Vec2::ZERO,
+            yaw_rate: 0.0,
+            steer_angle: 0.0,
             steer_input: 0.0,
             throttle_input: 0.0,
             brake_input: 0.0,
+            slip_angle_front: 0.0,
+            slip_angle_rear: 0.0,
+            lateral_force_front: 0.0,
+            lateral_force_rear: 0.0,
+            is_skidding: false,
             sensor_readings: [1.0; 7],
             sensor_hits: [None; 7],
             is_alive: true,
@@ -123,15 +169,20 @@ impl Car {
         }
     }
 
-    /// Reset car state for a new generation or track restart.
     pub fn reset(&mut self, position: Vec2, heading_angle: f32) {
         self.position = position;
-        self.velocity = Vec2::ZERO;
         self.heading_angle = heading_angle;
-        self.angular_velocity = 0.0;
+        self.velocity_local = Vec2::ZERO;
+        self.yaw_rate = 0.0;
+        self.steer_angle = 0.0;
         self.steer_input = 0.0;
         self.throttle_input = 0.0;
         self.brake_input = 0.0;
+        self.slip_angle_front = 0.0;
+        self.slip_angle_rear = 0.0;
+        self.lateral_force_front = 0.0;
+        self.lateral_force_rear = 0.0;
+        self.is_skidding = false;
         self.sensor_readings = [1.0; 7];
         self.sensor_hits = [None; 7];
         self.is_alive = true;
@@ -146,28 +197,34 @@ impl Car {
         self.top_speed_recorded = 0.0;
     }
 
-    /// Forward unit vector of the car.
+    /// Forward unit vector in world coordinates.
     #[inline(always)]
     pub fn forward_vector(&self) -> Vec2 {
         Vec2::from_angle(self.heading_angle)
     }
 
-    /// Right unit vector (lateral) of the car.
+    /// Right (lateral) unit vector in world coordinates.
     #[inline(always)]
     pub fn right_vector(&self) -> Vec2 {
         self.forward_vector().perpendicular()
     }
 
-    /// Forward speed (positive forward, negative reverse).
+    /// World velocity vector.
     #[inline(always)]
-    pub fn forward_speed(&self) -> f32 {
-        self.velocity.dot(self.forward_vector())
+    pub fn world_velocity(&self) -> Vec2 {
+        self.forward_vector() * self.velocity_local.x + self.right_vector() * self.velocity_local.y
     }
 
-    /// Lateral slip speed.
+    /// Forward speed in body frame.
+    #[inline(always)]
+    pub fn forward_speed(&self) -> f32 {
+        self.velocity_local.x
+    }
+
+    /// Lateral speed in body frame.
     #[inline(always)]
     pub fn lateral_speed(&self) -> f32 {
-        self.velocity.dot(self.right_vector())
+        self.velocity_local.y
     }
 
     /// Oriented bounding box corners in world coordinates [Front-Left, Front-Right, Rear-Right, Rear-Left].
@@ -218,11 +275,13 @@ impl Car {
         }
     }
 
-    /// Build neural network input vector (9 inputs):
-    /// [Ray0..Ray6 (7 distances), Normalized Speed, Steering Angle / Angular velocity].
-    pub fn get_network_inputs(&self) -> [f32; 9] {
-        let norm_speed = (self.forward_speed() / self.config.max_forward_speed).clamp(-0.2, 1.2);
-        let norm_steer = self.steer_input.clamp(-1.0, 1.0);
+    /// Build neural network input vector (11 rich inputs for deep neural control):
+    /// [Ray0..Ray6 (7 distances), Normalized Speed, Lateral Slip, Yaw Rate, Steer Angle].
+    pub fn get_network_inputs(&self) -> [f32; 11] {
+        let norm_speed = (self.velocity_local.x / 40.0).clamp(-0.5, 1.5);
+        let norm_lat_speed = (self.velocity_local.y / 15.0).clamp(-1.0, 1.0);
+        let norm_yaw_rate = (self.yaw_rate / 3.0).clamp(-1.0, 1.0);
+        let norm_steer = (self.steer_angle / self.config.max_steer_angle).clamp(-1.0, 1.0);
 
         [
             self.sensor_readings[0],
@@ -233,6 +292,8 @@ impl Car {
             self.sensor_readings[5],
             self.sensor_readings[6],
             norm_speed,
+            norm_lat_speed,
+            norm_yaw_rate,
             norm_steer,
         ]
     }
@@ -244,77 +305,150 @@ impl Car {
         self.brake_input = brake.clamp(0.0, 1.0);
     }
 
-    /// Physics integration step.
+    /// Realistic 2D Non-Linear Bicycle Dynamics Physics Step.
     pub fn physics_step(&mut self, dt: f32) {
         if !self.is_alive {
             return;
         }
 
-        let fwd = self.forward_vector();
-        let right = self.right_vector();
+        let g = 9.81f32;
+        let mass = self.config.mass;
+        let a = self.config.dist_cg_front;
+        let b = self.config.dist_cg_rear;
+        let l = a + b;
+        let h_cg = self.config.cg_height;
+        let iz = self.config.inertia;
 
-        let mut fwd_spd = self.forward_speed();
-        let mut lat_spd = self.lateral_speed();
+        // 1. Actuate Steering with realistic actuator speed
+        let target_steer = self.steer_input * self.config.max_steer_angle;
+        let steer_diff = target_steer - self.steer_angle;
+        let max_steer_step = self.config.steer_speed * dt;
+        self.steer_angle += steer_diff.clamp(-max_steer_step, max_steer_step);
 
-        // 1. Engine propulsion & braking forces
-        let accel_force = self.throttle_input * self.config.acceleration_rate;
-        let brake_force = self.brake_input * self.config.braking_rate;
+        let mut u = self.velocity_local.x; // Longitudinal speed
+        let mut v = self.velocity_local.y; // Lateral speed
+        let mut omega = self.yaw_rate;     // Yaw rate
 
-        // Apply acceleration
-        fwd_spd += accel_force * dt;
+        // 2. Compute normal axle loads with longitudinal weight transfer
+        let weight_front_static = (b / l) * mass * g;
+        let weight_rear_static = (a / l) * mass * g;
 
-        // Apply braking
-        if fwd_spd > 0.0 {
-            fwd_spd = (fwd_spd - brake_force * dt).max(0.0);
-        } else if self.throttle_input < 0.05 && self.brake_input > 0.1 {
-            // Reverse when stopped
-            fwd_spd = (fwd_spd - self.config.acceleration_rate * 0.4 * dt)
-                .max(-self.config.max_reverse_speed);
+        // Approximate longitudinal acceleration for weight transfer
+        let approx_ax = (self.throttle_input * self.config.max_engine_force
+            - self.brake_input * self.config.max_brake_force)
+            / mass;
+        let delta_weight = (h_cg / l) * mass * approx_ax;
+
+        let fz_front = (weight_front_static - delta_weight).clamp(mass * g * 0.1, mass * g * 0.9);
+        let fz_rear = (weight_rear_static + delta_weight).clamp(mass * g * 0.1, mass * g * 0.9);
+
+        // 3. Low-Speed Kinematic Blend vs High-Speed Dynamic Model
+        let speed_mag = (u * u + v * v).sqrt();
+        let kinematic_blend = (1.0 - (speed_mag / 3.0)).clamp(0.0, 1.0);
+
+        if kinematic_blend > 0.95 {
+            // Pure low-speed kinematic regime
+            let drive_force = self.throttle_input * self.config.max_engine_force * 0.3
+                - self.brake_input * self.config.max_brake_force * 0.4;
+            u += (drive_force / mass) * dt;
+            u = u.clamp(-6.0, 45.0);
+            v *= 0.85; // Suppress sideways drift when almost stopped
+
+            // Kinematic yaw rate
+            let target_omega = (u / l) * self.steer_angle.tan();
+            omega = target_omega;
+            self.slip_angle_front = 0.0;
+            self.slip_angle_rear = 0.0;
+            self.is_skidding = false;
+        } else {
+            // Full dynamic regime with Pacejka-like non-linear tire curves
+            let safe_u = u.abs().max(1.5) * u.signum();
+
+            // Slip angles (rad)
+            let alpha_f = ((v + a * omega) / safe_u).atan() - self.steer_angle;
+            let alpha_r = ((v - b * omega) / safe_u).atan();
+
+            self.slip_angle_front = alpha_f;
+            self.slip_angle_rear = alpha_r;
+
+            // Non-linear lateral tire forces (tanh saturation model)
+            let max_lat_f = self.config.friction_coeff * fz_front;
+            let max_lat_r = self.config.friction_coeff * fz_rear;
+
+            let fy_f = -max_lat_f * (self.config.cornering_stiffness_front * alpha_f / max_lat_f).tanh();
+            let fy_r = -max_lat_r * (self.config.cornering_stiffness_rear * alpha_r / max_lat_r).tanh();
+
+            self.lateral_force_front = fy_f;
+            self.lateral_force_rear = fy_r;
+
+            // Detect active skidding/drifting
+            self.is_skidding = alpha_f.abs() > 0.14 || alpha_r.abs() > 0.12;
+
+            // Longitudinal forces
+            let engine_force = self.throttle_input * self.config.max_engine_force;
+            let brake_force = if u > 0.1 {
+                self.brake_input * self.config.max_brake_force
+            } else if self.throttle_input < 0.05 && self.brake_input > 0.1 {
+                -self.config.max_reverse_force
+            } else {
+                0.0
+            };
+
+            let aero_drag = self.config.drag_coeff * u * u.abs();
+            let rolling_res = self.config.rolling_resistance * mass * g * 0.001 * u.signum();
+
+            let fx_rear = engine_force - brake_force * 0.5;
+            let fx_front = -brake_force * 0.5;
+
+            // Equations of motion in vehicle frame
+            let total_fx = fx_rear + fx_front * self.steer_angle.cos()
+                - fy_f * self.steer_angle.sin()
+                - aero_drag
+                - rolling_res;
+            let total_fy = fy_r + fy_f * self.steer_angle.cos() + fx_front * self.steer_angle.sin();
+            let yaw_torque = a * (fy_f * self.steer_angle.cos() + fx_front * self.steer_angle.sin()) - b * fy_r;
+
+            // Acceleration derivatives (including non-inertial Coriolis/centrifugal acceleration v * omega)
+            let du_dt = total_fx / mass + v * omega;
+            let dv_dt = total_fy / mass - u * omega;
+            let domega_dt = yaw_torque / iz;
+
+            u += du_dt * dt;
+            v += dv_dt * dt;
+            omega += domega_dt * dt;
+
+            // Apply damping at near-zero velocity
+            u = u.clamp(-8.0, 52.0);
+            v *= 0.98;
+            omega *= 0.96;
         }
 
-        // Top speed clamp
-        fwd_spd = fwd_spd.clamp(-self.config.max_reverse_speed, self.config.max_forward_speed);
+        self.velocity_local = Vec2::new(u, v);
+        self.yaw_rate = omega;
 
-        // 2. Air resistance and rolling friction
-        let drag_force = fwd_spd * fwd_spd.abs() * self.config.drag_coeff;
-        let rolling_friction = fwd_spd * 0.25;
-        fwd_spd -= (drag_force + rolling_friction) * dt;
+        // 4. Integrate Orientation & World Position
+        self.heading_angle += self.yaw_rate * dt;
 
-        // 3. Lateral grip / drift physics: damp lateral sliding velocity
-        let lateral_friction_factor = (1.0 - self.config.lateral_grip * (dt * 60.0).min(1.0)).max(0.0);
-        lat_spd *= lateral_friction_factor;
-
-        // Reconstruct 2D velocity vector
-        self.velocity = fwd * fwd_spd + right * lat_spd;
-
-        // 4. Steering and yaw rotation
-        // Steering response scales with speed (cannot turn while completely stationary)
-        let speed_factor = (fwd_spd.abs() / 120.0).min(1.0);
-        let turn_direction = if fwd_spd >= -1e-3 { 1.0 } else { -1.0 };
-        let target_turn_rate = self.steer_input
-            * self.config.steer_speed
-            * speed_factor
-            * turn_direction;
-
-        self.angular_velocity = target_turn_rate;
-        self.heading_angle += self.angular_velocity * dt;
-
-        // Keep angle in [-PI, PI] range
+        // Normalize angle into [-PI, PI]
         if self.heading_angle > PI {
             self.heading_angle -= 2.0 * PI;
         } else if self.heading_angle < -PI {
             self.heading_angle += 2.0 * PI;
         }
 
-        // 5. Integrate position
-        let step_dist = self.velocity.length() * dt;
-        self.position += self.velocity * dt;
+        // Scale physics velocity (m/s) to screen pixels (approx 12 pixels per meter)
+        let pixels_per_meter = 12.5f32;
+        let world_vel_pixels = self.world_velocity() * pixels_per_meter;
+
+        let step_dist = world_vel_pixels.length() * dt;
+        self.position += world_vel_pixels * dt;
         self.distance_traveled += step_dist;
         self.time_alive += dt;
         self.time_since_last_checkpoint += dt;
 
-        if fwd_spd > self.top_speed_recorded {
-            self.top_speed_recorded = fwd_spd;
+        let cur_speed_kmh = u.abs() * 3.6;
+        if cur_speed_kmh > self.top_speed_recorded {
+            self.top_speed_recorded = cur_speed_kmh;
         }
     }
 
@@ -359,7 +493,7 @@ impl Car {
         let gate = &track.checkpoints[next_idx];
 
         // Test if car crossed the gate line segment
-        let car_center_prev = self.position - self.velocity * 0.033;
+        let car_center_prev = self.position - self.world_velocity() * 0.04;
         let car_motion_seg = LineSegment::new(car_center_prev, self.position);
 
         let crossed = car_motion_seg.intersect_segment(&gate.gate_line).is_some()
@@ -368,7 +502,7 @@ impl Car {
         if crossed {
             // Verify forward direction (prevent backwards cheat)
             let fwd_alignment = self.forward_vector().dot(gate.forward_normal);
-            if fwd_alignment > -0.1 {
+            if fwd_alignment > -0.15 {
                 self.current_checkpoint_idx = next_idx;
                 self.checkpoints_hit += 1;
                 self.time_since_last_checkpoint = 0.0;
@@ -397,11 +531,7 @@ impl Car {
             0.0
         };
 
-        // Comprehensive fitness function:
-        // - Rewards checkpoint gates reached
-        // - Rewards laps completed
-        // - Rewards continuous fractional distance along segment
-        // - Rewards maintaining higher average speed
+        // Multi-factor reward fitness function
         let avg_speed = if self.time_alive > 0.1 {
             self.distance_traveled / self.time_alive
         } else {
@@ -409,9 +539,9 @@ impl Car {
         };
 
         let base_fitness = (self.checkpoints_hit as f32) * 1000.0
-            + (self.laps_completed as f32) * 20000.0
-            + progress_frac * 500.0
-            + avg_speed * 1.5;
+            + (self.laps_completed as f32) * 25000.0
+            + progress_frac * 600.0
+            + avg_speed * 2.0;
 
         self.fitness = base_fitness.max(0.0);
     }
@@ -440,11 +570,11 @@ mod tests {
         let mut car = Car::new(Vec2::new(100.0, 100.0), 0.0);
         car.apply_controls(0.0, 1.0, 0.0);
 
-        for _ in 0..10 {
+        for _ in 0..20 {
             car.physics_step(0.016);
         }
 
-        assert!(car.velocity.x > 0.0);
+        assert!(car.velocity_local.x > 0.0);
         assert!(car.position.x > 100.0);
         assert_eq!(car.is_alive, true);
     }
@@ -456,7 +586,7 @@ mod tests {
         car.update_sensors(&track);
 
         let inputs = car.get_network_inputs();
-        assert_eq!(inputs.len(), 9);
+        assert_eq!(inputs.len(), 11);
         for &r in &inputs[0..7] {
             assert!(r >= 0.0 && r <= 1.0);
         }

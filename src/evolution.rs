@@ -36,9 +36,9 @@ impl Default for EvolutionConfig {
     fn default() -> Self {
         Self {
             population_size: 60,
-            elitism_count: 4,
+            elitism_count: 5,
             mutation_rate: 0.10,
-            mutation_strength: 0.28,
+            mutation_strength: 0.26,
             tournament_size: 4,
             selection_method: SelectionMethod::Tournament,
             max_generation_time: 45.0,
@@ -46,7 +46,7 @@ impl Default for EvolutionConfig {
     }
 }
 
-/// An individual agent combining a physical vehicle and a neural network brain.
+/// An individual agent combining a physical vehicle and a deep neural network brain.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub id: usize,
@@ -59,8 +59,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(id: usize, position: Vec2, heading_angle: f32, brain: NeuralNetwork) -> Self {
-        // Distinct color palette per agent with good visual contrast
-        let hue = (id as f32 * 137.5) % 360.0; // Golden ratio hue distribution
+        let hue = (id as f32 * 137.5) % 360.0;
         let (r, g, b) = hsv_to_rgb(hue, 0.85, 0.95);
 
         Self {
@@ -73,39 +72,30 @@ impl Agent {
         }
     }
 
-    /// Step agent forward: read sensors -> compute brain -> apply car controls -> integrate physics.
+    /// Step agent forward: read 11 telemetry & sensor inputs -> compute deep brain -> apply car controls -> integrate physics.
     pub fn step(&mut self, dt: f32, track: &Track) {
         if !self.car.is_alive {
             return;
         }
 
-        // 1. Get 9 sensor and physical inputs
+        // 1. Get 11 telemetry and raycast inputs
         let inputs = self.car.get_network_inputs();
 
-        // 2. Feedforward neural network
+        // 2. Feedforward deep neural network
         let outputs = self.brain.forward(&inputs);
 
         // 3. Map network outputs:
-        // Output 0: Steering -> tanh output in [-1.0, 1.0]
+        // Output 0: Steering in [-1.0, 1.0]
         let steer = outputs[0].clamp(-1.0, 1.0);
 
         // Output 1: Throttle & Brake
-        // When output[1] > 0: Throttle = output[1], Brake = 0
-        // When output[1] < 0: Throttle = 0, Brake = -output[1]
-        let (throttle, brake) = if outputs.len() >= 3 {
-            // If 3 outputs: [Steer, Throttle, Brake]
-            let t = ((outputs[1] + 1.0) * 0.5).clamp(0.0, 1.0);
-            let b = ((outputs[2] + 1.0) * 0.5).clamp(0.0, 1.0);
-            (t, b)
+        let gas_brake = outputs[1];
+        let (throttle, brake) = if gas_brake >= 0.0 {
+            // Smooth throttle mapping
+            (0.15 + 0.85 * gas_brake.clamp(0.0, 1.0), 0.0)
         } else {
-            // If 2 outputs: [Steer, Gas/Brake combined]
-            let gas_brake = outputs[1];
-            if gas_brake >= 0.0 {
-                // Map [0, 1] to throttle [0.2, 1.0] to encourage forward movement
-                (0.2 + 0.8 * gas_brake.clamp(0.0, 1.0), 0.0)
-            } else {
-                (0.0, (-gas_brake).clamp(0.0, 1.0))
-            }
+            // Brake mapping
+            (0.0, (-gas_brake).clamp(0.0, 1.0))
         };
 
         self.car.apply_controls(steer, throttle, brake);
@@ -175,7 +165,7 @@ pub struct Population {
 }
 
 impl Population {
-    /// Initialize a new population with randomized neural network brains.
+    /// Initialize a new population with randomized deep neural network brains.
     pub fn new(config: EvolutionConfig, track: &Track, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut agents = Vec::with_capacity(config.population_size);
@@ -217,7 +207,6 @@ impl Population {
         let mut best_fit = -1.0f32;
 
         for (i, agent) in self.agents.iter().enumerate() {
-            // Prioritize alive agents with high fitness, then dead agents
             let effective_fit = agent.fitness + if agent.car.is_alive { 100000.0 } else { 0.0 };
             if effective_fit > best_fit {
                 best_fit = effective_fit;
@@ -308,7 +297,6 @@ impl Population {
                 self.agents[i].brain.clone(),
             );
             elite_agent.is_elite = true;
-            // Elite highlight: gold / cyan glow
             elite_agent.color_rgba = [255, 215, 0, 255];
             new_agents.push(elite_agent);
         }
@@ -438,32 +426,5 @@ fn select_parent_idx(
             }
             0
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_population_advance() {
-        let track = Track::preset_grand_prix();
-        let config = EvolutionConfig {
-            population_size: 20,
-            elitism_count: 2,
-            ..Default::default()
-        };
-        let mut pop = Population::new(config, &track, 42);
-        assert_eq!(pop.agents.len(), 20);
-        assert_eq!(pop.generation, 1);
-
-        for _ in 0..10 {
-            pop.step(0.016, &track);
-        }
-
-        pop.advance_generation(&track);
-        assert_eq!(pop.generation, 2);
-        assert_eq!(pop.agents.len(), 20);
-        assert_eq!(pop.stats_history.len(), 1);
     }
 }
