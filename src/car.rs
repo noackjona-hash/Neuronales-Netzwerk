@@ -1,6 +1,6 @@
 //! Realistic 2D Vehicle Dynamics (Bicycle / Two-Track Model with Tire Slip Angles,
 //! Lateral Grip Saturation, Weight Transfer, and Skid Mark Generation),
-//! Dynamic Lookahead Raycast Sensor Array, OBB Collision Detection, and Fitness Progression.
+//! Dynamic Lookahead Raycast Sensor Array, OBB Collision Detection, and Pro-Racer Fitness.
 
 #![allow(dead_code)]
 
@@ -17,35 +17,35 @@ pub enum DeathReason {
     WrongWay,
 }
 
-/// Vehicle Physical Parameters (based on real-world sports car dynamics).
+/// Vehicle Physical Parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct CarConfig {
-    pub length: f32,          // Visual length (pixels/units)
-    pub width: f32,           // Visual width (pixels/units)
-    pub mass: f32,            // Mass (kg)
-    pub inertia: f32,         // Yaw moment of inertia Iz (kg*m^2)
-    pub dist_cg_front: f32,   // Distance from CG to front axle (m)
-    pub dist_cg_rear: f32,    // Distance from CG to rear axle (m)
-    pub cg_height: f32,       // CG height for dynamic weight transfer (m)
+    pub length: f32,
+    pub width: f32,
+    pub mass: f32,
+    pub inertia: f32,
+    pub dist_cg_front: f32,
+    pub dist_cg_rear: f32,
+    pub cg_height: f32,
     
     // Tires & Cornering
-    pub cornering_stiffness_front: f32, // Front tire cornering stiffness (N/rad)
-    pub cornering_stiffness_rear: f32,  // Rear tire cornering stiffness (N/rad)
-    pub friction_coeff: f32,            // Peak tire friction coefficient (mu)
+    pub cornering_stiffness_front: f32,
+    pub cornering_stiffness_rear: f32,
+    pub friction_coeff: f32,
     
     // Drivetrain & Aerodynamics
-    pub max_engine_force: f32,          // Maximum forward propulsion force (N)
-    pub max_brake_force: f32,           // Maximum braking force (N)
-    pub max_reverse_force: f32,         // Maximum reverse force (N)
-    pub max_steer_angle: f32,           // Maximum wheel steering angle (radians)
-    pub steer_speed: f32,               // Steering actuator speed (rad/s)
-    pub drag_coeff: f32,                // Aerodynamic drag coefficient
-    pub rolling_resistance: f32,        // Rolling resistance coefficient
+    pub max_engine_force: f32,
+    pub max_brake_force: f32,
+    pub max_reverse_force: f32,
+    pub max_steer_angle: f32,
+    pub steer_speed: f32,
+    pub drag_coeff: f32,
+    pub rolling_resistance: f32,
     
     // Sensors & Rules
-    pub ray_sensor_base_range: f32,     // Base sensor range (pixels)
-    pub ray_sensor_angles: [f32; 9],    // 9 Wide-angle sensor rays
-    pub checkpoint_timeout: f32,        // Seconds before timeout
+    pub ray_sensor_base_range: f32,
+    pub ray_sensor_angles: [f32; 9],
+    pub checkpoint_timeout: f32,
 }
 
 impl Default for CarConfig {
@@ -58,17 +58,17 @@ impl Default for CarConfig {
             dist_cg_front: 1.25,
             dist_cg_rear: 1.35,
             cg_height: 0.45,
-            cornering_stiffness_front: 46000.0,
-            cornering_stiffness_rear: 53000.0,
-            friction_coeff: 1.18,
-            max_engine_force: 7400.0,
-            max_brake_force: 11500.0,
+            cornering_stiffness_front: 48000.0,
+            cornering_stiffness_rear: 55000.0,
+            friction_coeff: 1.20,
+            max_engine_force: 7800.0,
+            max_brake_force: 12000.0,
             max_reverse_force: 3500.0,
-            max_steer_angle: 0.58, // ~33.2 degrees
-            steer_speed: 6.8,
-            drag_coeff: 0.38,
+            max_steer_angle: 0.60,
+            steer_speed: 7.2,
+            drag_coeff: 0.36,
             rolling_resistance: 12.0,
-            ray_sensor_base_range: 260.0,
+            ray_sensor_base_range: 280.0,
             ray_sensor_angles: [
                 -85.0 * PI / 180.0,
                 -60.0 * PI / 180.0,
@@ -80,38 +80,39 @@ impl Default for CarConfig {
                 60.0 * PI / 180.0,
                 85.0 * PI / 180.0,
             ],
-            checkpoint_timeout: 4.0,
+            checkpoint_timeout: 4.5,
         }
     }
 }
 
-/// 2D Realistic Physics Car with 9 Dynamic Sensors & Track Navigation.
+/// 2D Realistic Physics Car with 14 High-Dimensional Telemetry Inputs.
 #[derive(Debug, Clone)]
 pub struct Car {
     pub config: CarConfig,
     pub position: Vec2,
     
     // Body state in local & world coordinates
-    pub heading_angle: f32,     // Yaw orientation (rad)
+    pub heading_angle: f32,
     pub velocity_local: Vec2,   // (u = longitudinal forward, v = lateral sideways)
-    pub yaw_rate: f32,          // Angular velocity omega (rad/s)
-    pub steer_angle: f32,       // Current front wheel steering angle (rad)
+    pub yaw_rate: f32,
+    pub steer_angle: f32,
     
     // Control inputs
-    pub steer_input: f32,       // [-1.0, 1.0]
-    pub throttle_input: f32,    // [0.0, 1.0]
-    pub brake_input: f32,       // [0.0, 1.0]
+    pub steer_input: f32,
+    pub throttle_input: f32,
+    pub brake_input: f32,
 
-    // Realistic physics telemetry
+    // Telemetry & Lookahead
     pub slip_angle_front: f32,
     pub slip_angle_rear: f32,
     pub lateral_force_front: f32,
     pub lateral_force_rear: f32,
     pub is_skidding: bool,
-    pub next_target_angle_diff: f32, // Relative angle difference to upcoming track apex
+    pub target_apex_angle_1: f32, // Next checkpoint angle difference
+    pub target_apex_angle_2: f32, // 2nd checkpoint curvature lookahead
 
     // 9 Raycast Sensors
-    pub sensor_readings: [f32; 9], // Normalized [0.0, 1.0]
+    pub sensor_readings: [f32; 9],
     pub sensor_hits: [Option<RaycastHit>; 9],
 
     // Progress & Fitness
@@ -125,6 +126,7 @@ pub struct Car {
     pub time_since_last_checkpoint: f32,
     pub fitness: f32,
     pub top_speed_recorded: f32,
+    pub clean_racing_line_score: f32,
 }
 
 impl Car {
@@ -148,7 +150,8 @@ impl Car {
             lateral_force_front: 0.0,
             lateral_force_rear: 0.0,
             is_skidding: false,
-            next_target_angle_diff: 0.0,
+            target_apex_angle_1: 0.0,
+            target_apex_angle_2: 0.0,
             sensor_readings: [1.0; 9],
             sensor_hits: [None; 9],
             is_alive: true,
@@ -161,6 +164,7 @@ impl Car {
             time_since_last_checkpoint: 0.0,
             fitness: 0.0,
             top_speed_recorded: 0.0,
+            clean_racing_line_score: 0.0,
         }
     }
 
@@ -178,7 +182,8 @@ impl Car {
         self.lateral_force_front = 0.0;
         self.lateral_force_rear = 0.0;
         self.is_skidding = false;
-        self.next_target_angle_diff = 0.0;
+        self.target_apex_angle_1 = 0.0;
+        self.target_apex_angle_2 = 0.0;
         self.sensor_readings = [1.0; 9];
         self.sensor_hits = [None; 9];
         self.is_alive = true;
@@ -191,6 +196,7 @@ impl Car {
         self.time_since_last_checkpoint = 0.0;
         self.fitness = 0.0;
         self.top_speed_recorded = 0.0;
+        self.clean_racing_line_score = 0.0;
     }
 
     #[inline(always)]
@@ -223,10 +229,10 @@ impl Car {
         let right = self.right_vector() * (self.config.width * 0.5);
 
         [
-            self.position + fwd - right, // Front-Left
-            self.position + fwd + right, // Front-Right
-            self.position - fwd + right, // Rear-Right
-            self.position - fwd - right, // Rear-Left
+            self.position + fwd - right,
+            self.position + fwd + right,
+            self.position - fwd + right,
+            self.position - fwd - right,
         ]
     }
 
@@ -240,13 +246,11 @@ impl Car {
         ]
     }
 
-    /// Dynamic speed-dependent sensor range: allows neural net to see further ahead at higher velocities.
     pub fn current_sensor_range(&self) -> f32 {
         let speed = self.velocity_local.x.abs();
-        self.config.ray_sensor_base_range + speed * 4.2
+        self.config.ray_sensor_base_range + speed * 4.5
     }
 
-    /// Update raycast sensors against track boundaries with speed lookahead.
     pub fn update_sensors(&mut self, track: &Track) {
         let fwd_angle = self.heading_angle;
         let sensor_origin = self.position + self.forward_vector() * (self.config.length * 0.4);
@@ -270,27 +274,34 @@ impl Car {
             }
         }
 
-        // Calculate relative target angle to upcoming checkpoint
+        // Lookahead 1 & 2 Checkpoint Angles
         let num_checkpoints = track.checkpoints.len();
         if num_checkpoints > 0 {
-            let next_idx = (self.current_checkpoint_idx + 1) % num_checkpoints;
-            let target_center = track.checkpoints[next_idx].center;
-            let to_target = (target_center - self.position).normalize();
-            let target_angle = to_target.to_angle();
-            let mut diff = target_angle - self.heading_angle;
+            let next_idx_1 = (self.current_checkpoint_idx + 1) % num_checkpoints;
+            let next_idx_2 = (self.current_checkpoint_idx + 3) % num_checkpoints;
 
-            while diff > PI { diff -= 2.0 * PI; }
-            while diff < -PI { diff += 2.0 * PI; }
+            let target_center_1 = track.checkpoints[next_idx_1].center;
+            let to_target_1 = (target_center_1 - self.position).normalize();
+            let mut diff_1 = to_target_1.to_angle() - self.heading_angle;
+            while diff_1 > PI { diff_1 -= 2.0 * PI; }
+            while diff_1 < -PI { diff_1 += 2.0 * PI; }
+            self.target_apex_angle_1 = (diff_1 / PI).clamp(-1.0, 1.0);
 
-            self.next_target_angle_diff = (diff / PI).clamp(-1.0, 1.0);
+            let target_center_2 = track.checkpoints[next_idx_2].center;
+            let to_target_2 = (target_center_2 - target_center_1).normalize();
+            let mut diff_2 = to_target_2.to_angle() - self.heading_angle;
+            while diff_2 > PI { diff_2 -= 2.0 * PI; }
+            while diff_2 < -PI { diff_2 += 2.0 * PI; }
+            self.target_apex_angle_2 = (diff_2 / PI).clamp(-1.0, 1.0);
         }
     }
 
-    /// Build rich 12-dimensional neural input vector:
-    /// [Ray0..Ray8 (9 dynamic distance readings), Normalized Speed, Lateral Slip, Relative Track Angle to Apex].
-    pub fn get_network_inputs(&self) -> [f32; 12] {
+    /// Build rich 14-dimensional neural network input vector:
+    /// [Ray0..Ray8 (9 dynamic distance readings), Forward Speed, Lateral Speed, Steering Angle, Apex Angle 1, Lookahead Curvature 2].
+    pub fn get_network_inputs(&self) -> [f32; 14] {
         let norm_speed = (self.velocity_local.x / 40.0).clamp(-0.5, 1.5);
         let norm_lat_speed = (self.velocity_local.y / 15.0).clamp(-1.0, 1.0);
+        let norm_steer = (self.steer_angle / self.config.max_steer_angle.max(0.1)).clamp(-1.0, 1.0);
 
         [
             self.sensor_readings[0].clamp(0.0, 1.0),
@@ -304,7 +315,9 @@ impl Car {
             self.sensor_readings[8].clamp(0.0, 1.0),
             norm_speed,
             norm_lat_speed,
-            self.next_target_angle_diff,
+            norm_steer,
+            self.target_apex_angle_1,
+            self.target_apex_angle_2,
         ]
     }
 
@@ -314,7 +327,6 @@ impl Car {
         self.brake_input = if brake.is_nan() { 0.0 } else { brake.clamp(0.0, 1.0) };
     }
 
-    /// Realistic 2D Non-Linear Bicycle Dynamics Physics Step.
     pub fn physics_step(&mut self, dt: f32) {
         if !self.is_alive {
             return;
@@ -328,7 +340,7 @@ impl Car {
         let h_cg = self.config.cg_height.max(0.05);
         let iz = self.config.inertia.max(100.0);
 
-        // 1. Actuate Steering with realistic response
+        // 1. Actuate Steering with smooth actuator speed
         let target_steer = self.steer_input * self.config.max_steer_angle;
         let steer_diff = target_steer - self.steer_angle;
         let max_steer_step = self.config.steer_speed * dt;
@@ -358,7 +370,7 @@ impl Car {
             let drive_force = self.throttle_input * self.config.max_engine_force * 0.35
                 - self.brake_input * self.config.max_brake_force * 0.45;
             u += (drive_force / mass) * dt;
-            u = u.clamp(-6.0, 45.0);
+            u = u.clamp(-6.0, 48.0);
             v *= 0.85;
 
             let target_omega = (u / l) * self.steer_angle.tan();
@@ -422,7 +434,7 @@ impl Car {
                 omega += domega_dt * dt;
             }
 
-            u = u.clamp(-8.0, 52.0);
+            u = u.clamp(-8.0, 55.0);
             v *= 0.98;
             omega *= 0.96;
         }
@@ -454,7 +466,6 @@ impl Car {
         }
     }
 
-    /// Check collisions with track walls.
     pub fn check_wall_collisions(&mut self, track: &Track) {
         if !self.is_alive {
             return;
@@ -472,7 +483,6 @@ impl Car {
         }
     }
 
-    /// Check checkpoint crossings and calculate updated fitness.
     pub fn check_checkpoints(&mut self, track: &Track) {
         if !self.is_alive {
             return;
@@ -496,7 +506,7 @@ impl Car {
         let car_motion_seg = LineSegment::new(car_center_prev, self.position);
 
         let crossed = car_motion_seg.intersect_segment(&gate.gate_line).is_some()
-            || self.position.distance_sq(gate.center) < (track.track_width * 0.5).powi(2);
+            || self.position.distance_sq(gate.center) < (track.track_width * 0.55).powi(2);
 
         if crossed {
             let fwd_alignment = self.forward_vector().dot(gate.forward_normal);
@@ -504,6 +514,11 @@ impl Car {
                 self.current_checkpoint_idx = next_idx;
                 self.checkpoints_hit += 1;
                 self.time_since_last_checkpoint = 0.0;
+
+                // Centerline precision reward
+                let dist_from_center = self.position.distance(gate.center);
+                let center_quality = (1.0 - (dist_from_center / (track.track_width * 0.5))).clamp(0.0, 1.0);
+                self.clean_racing_line_score += center_quality * 50.0;
 
                 if next_idx == 0 && self.checkpoints_hit > num_checkpoints / 2 {
                     self.laps_completed += 1;
@@ -533,15 +548,15 @@ impl Car {
             0.0
         };
 
-        let base_fitness = (self.checkpoints_hit as f32) * 1000.0
-            + (self.laps_completed as f32) * 25000.0
-            + progress_frac * 600.0
-            + avg_speed * 2.0;
+        let base_fitness = (self.checkpoints_hit as f32) * 1200.0
+            + (self.laps_completed as f32) * 35000.0
+            + progress_frac * 800.0
+            + avg_speed * 3.5
+            + self.clean_racing_line_score;
 
         self.fitness = if base_fitness.is_nan() { 0.0 } else { base_fitness.max(0.0) };
     }
 
-    /// Full update cycle: physics -> collision -> checkpoints -> sensors.
     pub fn update(&mut self, dt: f32, track: &Track) {
         if !self.is_alive {
             return;
@@ -581,7 +596,7 @@ mod tests {
         car.update_sensors(&track);
 
         let inputs = car.get_network_inputs();
-        assert_eq!(inputs.len(), 12);
+        assert_eq!(inputs.len(), 14);
         for &r in &inputs[0..9] {
             assert!(r >= 0.0 && r <= 1.0);
         }

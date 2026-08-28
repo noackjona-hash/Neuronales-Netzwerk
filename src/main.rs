@@ -36,7 +36,8 @@ pub struct AppState {
     pub player_car: Option<Car>,
     pub manual_drive: bool,
     pub paused: bool,
-    pub sim_speed: usize, // 1x, 2x, 5x, 10x, 25x, 50x
+    pub sim_speed: usize, // 1x to 1000x
+    pub turbo_mode: bool, // Headless maximum CPU batch training
     pub camera_mode: CameraMode,
     pub cam_pos: Vec2,
     pub cam_target: Vec2,
@@ -47,7 +48,7 @@ pub struct AppState {
     pub show_help: bool,
     pub show_sensors: bool,
     pub skid_marks: Vec<SkidSegment>,
-    pub toast_message: Option<(String, f32)>, // message, display timer
+    pub toast_message: Option<(String, f32)>,
 }
 
 fn window_conf() -> Conf {
@@ -81,15 +82,16 @@ async fn main() {
         // Process User Inputs & Hotkeys
         handle_input(&mut state);
 
-        // Simulation Physics Step (with speed multiplier)
+        // Simulation Physics Step (with speed multiplier & turbo mode)
         if !state.paused {
-            let steps = state.sim_speed;
+            let steps = if state.turbo_mode { 250 } else { state.sim_speed };
             for _ in 0..steps {
-                // Step Population
                 state.population.step(dt_fixed, &state.track);
 
-                // Collect skid marks
-                collect_skid_marks(&mut state);
+                // Collect skid marks only in normal rendering speeds to keep 1000x smooth
+                if !state.turbo_mode && state.sim_speed <= 50 {
+                    collect_skid_marks(&mut state);
+                }
 
                 // Step Manual Player Car if active
                 if state.manual_drive {
@@ -115,7 +117,7 @@ async fn main() {
         // Update Camera smoothly
         update_camera(&mut state, frame_dt);
 
-        // Render Frame safely with resolution protection
+        // Render Frame safely
         clear_background(Color::new(0.07, 0.09, 0.12, 1.0));
 
         // 1. World Space Rendering
@@ -153,6 +155,7 @@ fn init_app_state() -> AppState {
         manual_drive: false,
         paused: false,
         sim_speed: 1,
+        turbo_mode: false,
         camera_mode: CameraMode::FollowBest,
         cam_pos: start_pos,
         cam_target: start_pos,
@@ -163,7 +166,7 @@ fn init_app_state() -> AppState {
         show_help: false,
         show_sensors: true,
         skid_marks: Vec::with_capacity(2048),
-        toast_message: Some(("NeuroRacer: Adaptive Evolution Engine! [H] for controls.".to_string(), 4.5)),
+        toast_message: Some(("NeuroRacer: Speeds up to 1000x! [Tab] for Turbo Mode.".to_string(), 4.5)),
     }
 }
 
@@ -209,24 +212,56 @@ fn handle_input(state: &mut AppState) {
         state.paused = !state.paused;
     }
 
-    // Number keys: Simulation Speed
+    // Number keys: Ultra-Wide Simulation Speeds from 1x to 1000x
     if is_key_pressed(KeyCode::Key1) {
         state.sim_speed = 1;
+        state.turbo_mode = false;
     }
     if is_key_pressed(KeyCode::Key2) {
         state.sim_speed = 2;
+        state.turbo_mode = false;
     }
     if is_key_pressed(KeyCode::Key3) {
         state.sim_speed = 5;
+        state.turbo_mode = false;
     }
     if is_key_pressed(KeyCode::Key4) {
         state.sim_speed = 10;
+        state.turbo_mode = false;
     }
     if is_key_pressed(KeyCode::Key5) {
         state.sim_speed = 25;
+        state.turbo_mode = false;
     }
     if is_key_pressed(KeyCode::Key6) {
         state.sim_speed = 50;
+        state.turbo_mode = false;
+    }
+    if is_key_pressed(KeyCode::Key7) {
+        state.sim_speed = 100;
+        state.turbo_mode = false;
+    }
+    if is_key_pressed(KeyCode::Key8) {
+        state.sim_speed = 250;
+        state.turbo_mode = false;
+    }
+    if is_key_pressed(KeyCode::Key9) {
+        state.sim_speed = 500;
+        state.turbo_mode = false;
+    }
+    if is_key_pressed(KeyCode::Key0) {
+        state.sim_speed = 1000;
+        state.turbo_mode = false;
+    }
+
+    // Tab / B: Turbo Training Mode (Ultra Fast-Forward)
+    if is_key_pressed(KeyCode::Tab) || is_key_pressed(KeyCode::B) {
+        state.turbo_mode = !state.turbo_mode;
+        if state.turbo_mode {
+            state.toast_message = Some(("TURBO TRAINING ACTIVE: Maximum CPU training rate!".to_string(), 2.5));
+        } else {
+            state.toast_message = Some((format!("Returned to standard speed ({}x)", state.sim_speed), 2.0));
+        }
     }
 
     // T: Next Track Preset
@@ -298,7 +333,7 @@ fn handle_input(state: &mut AppState) {
         }
     }
 
-    // K: Kill current generation (advance immediately)
+    // K: Kill current generation
     if is_key_pressed(KeyCode::K) {
         state.population.advance_generation(&state.track);
         state.skid_marks.clear();
@@ -308,14 +343,14 @@ fn handle_input(state: &mut AppState) {
         state.toast_message = Some(("Skipped to next generation".to_string(), 2.0));
     }
 
-    // R: Reset all training
+    // R: Reset simulation
     if is_key_pressed(KeyCode::R) {
         state.population.reset_to_track(&state.track);
         state.skid_marks.clear();
         state.toast_message = Some(("Reset simulation to Generation 1".to_string(), 2.0));
     }
 
-    // S: Save best brain to JSON
+    // S: Save best brain
     if is_key_pressed(KeyCode::S) {
         if let Some(brain) = &state.population.best_ever_brain {
             if let Ok(json) = brain.to_json() {
@@ -326,7 +361,7 @@ fn handle_input(state: &mut AppState) {
         }
     }
 
-    // L: Load best brain from JSON
+    // L: Load best brain
     if is_key_pressed(KeyCode::L) {
         if let Ok(json) = std::fs::read_to_string("best_car_nn.json") {
             if let Ok(brain) = NeuralNetwork::from_json(&json) {
@@ -426,7 +461,7 @@ fn update_camera(state: &mut AppState, dt: f32) {
 }
 
 // ==========================================
-// WORLD DRAWING (Track, Skid Marks, Cars, Sensors)
+// WORLD DRAWING
 // ==========================================
 
 fn draw_world(state: &AppState) {
@@ -444,10 +479,10 @@ fn draw_world(state: &AppState) {
 
     set_camera(&camera);
 
-    // 1. Draw Asphalt Road Surface
+    // 1. Asphalt Surface
     draw_track_surface(&state.track);
 
-    // 2. Draw Skid Marks
+    // 2. Skid Marks
     for s in &state.skid_marks {
         draw_line(
             s.start.x,
@@ -459,7 +494,7 @@ fn draw_world(state: &AppState) {
         );
     }
 
-    // 3. Draw Checkpoint Gates (subtle)
+    // 3. Checkpoint Gates
     for gate in &state.track.checkpoints {
         draw_line(
             gate.inner_pt.x,
@@ -471,10 +506,10 @@ fn draw_world(state: &AppState) {
         );
     }
 
-    // 4. Draw Boundaries, Barriers & Kerbs
+    // 4. Boundaries, Barriers & Kerbs
     draw_track_boundaries(&state.track);
 
-    // 5. Draw Start/Finish Line
+    // 5. Start/Finish Line
     let start_gate = &state.track.checkpoints[0];
     draw_line(
         start_gate.inner_pt.x,
@@ -485,17 +520,15 @@ fn draw_world(state: &AppState) {
         Color::new(1.0, 1.0, 1.0, 0.9),
     );
 
-    // 6. Draw Population Cars
+    // 6. Population Cars
     let leader_idx = state.population.leader_idx();
 
-    // Dead cars
     for agent in &state.population.agents {
         if !agent.car.is_alive {
             draw_car_body(&agent.car, Color::new(0.4, 0.4, 0.4, 0.25), false, false);
         }
     }
 
-    // Alive cars
     for (i, agent) in state.population.agents.iter().enumerate() {
         if agent.car.is_alive {
             let is_leader = i == leader_idx;
@@ -505,7 +538,6 @@ fn draw_world(state: &AppState) {
         }
     }
 
-    // Manual player car
     if state.manual_drive {
         if let Some(player) = &state.player_car {
             let player_col = if player.is_alive {
@@ -517,7 +549,7 @@ fn draw_world(state: &AppState) {
         }
     }
 
-    // 7. 9 Dynamic Lookahead Sensor Rays for Leader Car
+    // 7. Sensor Rays for Leader Car
     if state.show_sensors && !state.population.agents.is_empty() {
         let leader_car = if state.manual_drive && state.player_car.as_ref().map_or(false, |c| c.is_alive) {
             state.player_car.as_ref().unwrap()
@@ -597,14 +629,12 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool
     let fwd = car.forward_vector();
     let right = car.right_vector();
 
-    // 1. Leader / Novelty Glow Aura
     if is_highlighted && car.is_alive {
         draw_poly(car.position.x, car.position.y, 16, 26.0, 0.0, Color::new(1.0, 0.84, 0.0, 0.25));
     } else if is_novelty && car.is_alive {
         draw_poly(car.position.x, car.position.y, 16, 22.0, 0.0, Color::new(1.0, 0.4, 0.7, 0.20));
     }
 
-    // 2. Realistic Steered Front Wheels & Rear Drive Wheels
     let wheel_w = 4.0;
     let wheel_l = 8.0;
 
@@ -625,7 +655,6 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool
     draw_wheel(rl_wheel, fwd, right, wheel_l, wheel_w);
     draw_wheel(rr_wheel, fwd, right, wheel_l, wheel_w);
 
-    // 3. Car Chassis
     draw_triangle(
         vec2(corners[0].x, corners[0].y),
         vec2(corners[1].x, corners[1].y),
@@ -639,7 +668,6 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool
         color,
     );
 
-    // 4. Chassis Outline
     let outline_col = if is_highlighted {
         Color::new(1.0, 0.9, 0.2, 1.0)
     } else {
@@ -652,7 +680,6 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool
         draw_line(p1.x, p1.y, p2.x, p2.y, if is_highlighted { 2.5 } else { 1.5 }, outline_col);
     }
 
-    // 5. Windshield & Hood Arrow indicator
     let nose = car.position + fwd * (car.config.length * 0.45);
     let front_hood = car.position + fwd * (car.config.length * 0.15);
     let glass_l = front_hood - right * (car.config.width * 0.3);
@@ -665,13 +692,11 @@ fn draw_car_body(car: &Car, color: Color, is_highlighted: bool, is_novelty: bool
         Color::new(0.1, 0.15, 0.2, 0.9),
     );
 
-    // Headlights
     let fl = corners[0];
     let fr = corners[1];
     draw_circle(fl.x * 0.9 + nose.x * 0.1, fl.y * 0.9 + nose.y * 0.1, 2.0, Color::new(1.0, 1.0, 0.6, 0.9));
     draw_circle(fr.x * 0.9 + nose.x * 0.1, fr.y * 0.9 + nose.y * 0.1, 2.0, Color::new(1.0, 1.0, 0.6, 0.9));
 
-    // Brake lights if braking
     if car.brake_input > 0.1 {
         let rl = corners[3];
         let rr = corners[2];
@@ -772,13 +797,12 @@ fn draw_hud(state: &AppState) {
     draw_text(&format!("BEST: {:.0}", best_fit), 180.0 + col_w * 3.0, y_text, font_size, Color::new(1.0, 0.85, 0.2, 1.0));
     draw_text(&format!("RECORD: {:.0}", record_fit), 180.0 + col_w * 4.0, y_text, font_size, Color::new(0.4, 1.0, 0.6, 1.0));
 
-    // Stagnation / Mutation Temperature indicator
     let temp_col = if temp > 1.8 {
-        Color::new(1.0, 0.3, 0.2, 1.0) // Red (Hypermutation Active)
+        Color::new(1.0, 0.3, 0.2, 1.0)
     } else if temp > 1.2 {
-        Color::new(1.0, 0.8, 0.2, 1.0) // Yellow (Heating up)
+        Color::new(1.0, 0.8, 0.2, 1.0)
     } else {
-        Color::new(0.3, 0.9, 0.5, 1.0) // Green (Fine-tuning)
+        Color::new(0.3, 0.9, 0.5, 1.0)
     };
     draw_text(
         &format!("MUT TEMP: {:.1}x", temp),
@@ -788,16 +812,23 @@ fn draw_hud(state: &AppState) {
         temp_col,
     );
 
-    let speed_text = if state.paused { "PAUSED" } else { &format!("{}x", state.sim_speed) };
-    draw_text(&format!("SPD: {}", speed_text), 180.0 + col_w * 6.0, y_text, font_size, Color::new(0.9, 0.6, 1.0, 1.0));
+    let speed_text = if state.paused {
+        "PAUSED"
+    } else if state.turbo_mode {
+        "⚡ TURBO"
+    } else {
+        &format!("{}x", state.sim_speed)
+    };
+    let speed_col = if state.turbo_mode { Color::new(1.0, 0.85, 0.1, 1.0) } else { Color::new(0.9, 0.6, 1.0, 1.0) };
+    draw_text(&format!("SPD: {}", speed_text), 180.0 + col_w * 6.0, y_text, font_size, speed_col);
 
     // 2. Deep Neural Network Visualizer HUD (Bottom-Right)
     if state.show_nn_hud && !state.population.agents.is_empty() {
         let leader_idx = state.population.leader_idx();
         let leader_agent = &state.population.agents[leader_idx];
         
-        let hud_w = 460.0f32.min(scr_w - 40.0);
-        let hud_h = 300.0f32.min(scr_h - 90.0);
+        let hud_w = 470.0f32.min(scr_w - 40.0);
+        let hud_h = 310.0f32.min(scr_h - 90.0);
         let hud_x = scr_w - hud_w - 15.0;
         let hud_y = scr_h - hud_h - 15.0;
         
@@ -825,7 +856,7 @@ fn draw_hud(state: &AppState) {
     if state.show_help {
         draw_help_overlay(scr_w, scr_h);
     } else {
-        draw_text("[H] Controls  [M] Manual Drive", 18.0, scr_h - 10.0, 15.0, Color::new(0.5, 0.6, 0.7, 0.8));
+        draw_text("[H] Controls  [Tab] Turbo Warp Train", 18.0, scr_h - 10.0, 15.0, Color::new(0.5, 0.6, 0.7, 0.8));
     }
 }
 
@@ -924,22 +955,19 @@ fn draw_deep_neural_network_hud(agent: &evolution::Agent, x: f32, y: f32, w: f32
 
     let meter_y = y + h - 18.0;
 
-    // Telemetry text
     draw_text(
-        &format!("SPD: {:.0}km/h | SLIP: {:.1}° | APEX: {:+.1}°", speed_kmh, slip_deg, agent.car.next_target_angle_diff * 180.0),
+        &format!("SPD: {:.0}km/h | SLIP: {:.1}° | APEX1: {:+.1}°", speed_kmh, slip_deg, agent.car.target_apex_angle_1 * 180.0),
         x + 15.0,
         meter_y - 12.0,
         12.0,
         Color::new(0.7, 0.85, 1.0, 0.9),
     );
 
-    // Steering meter
     draw_text(&format!("STR: {:+.2}", steer), x + 15.0, meter_y, 13.0, Color::new(0.9, 0.9, 0.9, 0.9));
     draw_rectangle(x + 90.0, meter_y - 9.0, 60.0, 10.0, Color::new(0.15, 0.2, 0.25, 1.0));
     let steer_w = (steer * 30.0).clamp(-30.0, 30.0);
     draw_rectangle(x + 120.0, meter_y - 9.0, steer_w, 10.0, Color::new(0.2, 0.8, 1.0, 1.0));
 
-    // Gas/Brake meter
     draw_text(&format!("GAS: {:+.2}", gas), x + 195.0, meter_y, 13.0, Color::new(0.9, 0.9, 0.9, 0.9));
     draw_rectangle(x + 270.0, meter_y - 9.0, 60.0, 10.0, Color::new(0.15, 0.2, 0.25, 1.0));
     let gas_w = (gas * 60.0).clamp(0.0, 60.0);
@@ -978,8 +1006,8 @@ fn draw_fitness_graph(history: &[evolution::GenerationStats], x: f32, y: f32, w:
 }
 
 fn draw_help_overlay(scr_w: f32, scr_h: f32) {
-    let pw = 540.0f32.min(scr_w - 40.0);
-    let ph = 410.0f32.min(scr_h - 40.0);
+    let pw = 560.0f32.min(scr_w - 40.0);
+    let ph = 430.0f32.min(scr_h - 40.0);
     let px = (scr_w - pw) * 0.5;
     let py = (scr_h - ph) * 0.5;
 
@@ -990,7 +1018,8 @@ fn draw_help_overlay(scr_w: f32, scr_h: f32) {
 
     let items = [
         ("[Space]", "Pause / Resume simulation"),
-        ("[1] - [6]", "Simulation Speed (1x, 2x, 5x, 10x, 25x, 50x)"),
+        ("[1] - [0]", "Simulation Speed: 1x, 2x, 5x, 10x, 25x, 50x, 100x, 250x, 500x, 1000x!"),
+        ("[Tab] / [B]", "⚡ TURBO TRAINING: Maximum CPU training rate (50 gens in seconds)"),
         ("[T]", "Cycle Track Presets (Monaco, Speedway, Hairpin, Figure-8, Procedural)"),
         ("[C]", "Cycle Camera (Follow Best <-> Track Overview <-> Free Pan)"),
         ("[Right Click Drag]", "Free Pan Camera across racetrack"),
@@ -1001,15 +1030,14 @@ fn draw_help_overlay(scr_w: f32, scr_h: f32) {
         ("[M]", "Toggle Manual Player Car (Drive with W/A/S/D or Arrows)"),
         ("[K]", "Kill current generation & advance immediately"),
         ("[R]", "Reset entire simulation to Generation 1"),
-        ("[S]", "Save Deep Champion Brain to best_car_nn.json"),
-        ("[L]", "Load Deep Champion Brain from best_car_nn.json"),
+        ("[S] / [L]", "Save / Load Champion Brain (best_car_nn.json)"),
         ("[H]", "Close this Help Dialog"),
     ];
 
     let mut cur_y = py + 68.0;
     for (key, desc) in items {
-        draw_text(key, px + 25.0, cur_y, 15.0, Color::new(1.0, 0.85, 0.2, 1.0));
-        draw_text(desc, px + 155.0, cur_y, 15.0, Color::new(0.85, 0.9, 0.95, 0.9));
-        cur_y += 22.0;
+        draw_text(key, px + 25.0, cur_y, 14.0, Color::new(1.0, 0.85, 0.2, 1.0));
+        draw_text(desc, px + 155.0, cur_y, 14.0, Color::new(0.85, 0.9, 0.95, 0.9));
+        cur_y += 23.0;
     }
 }

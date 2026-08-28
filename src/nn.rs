@@ -232,16 +232,16 @@ impl NeuralNetwork {
     }
 
     /// Deep car driving brain architecture with 4 hidden layers:
-    /// Topology: [12 -> 32 -> 24 -> 16 -> 12 -> 2]
+    /// Topology: [14 -> 32 -> 24 -> 16 -> 12 -> 2]
     pub fn default_car_brain<R: Rng + ?Sized>(rng: &mut R) -> Self {
         Self::new(
-            &[12, 32, 24, 16, 12, 2],
+            &[14, 32, 24, 16, 12, 2],
             &[
-                Activation::LeakyReLU { alpha: 0.05 }, // Hidden 1: 32 (Raycast spatial perception)
-                Activation::ReLU,                      // Hidden 2: 24 (Corner geometry & speed prediction)
-                Activation::Tanh,                      // Hidden 3: 16 (Grip limits & lateral slip control)
-                Activation::Tanh,                      // Hidden 4: 12 (Steering & braking blending)
-                Activation::Tanh,                      // Output: 2 (Steer & Gas/Brake)
+                Activation::LeakyReLU { alpha: 0.05 }, // Hidden 1: 32 (Spatial perception & speed scaling)
+                Activation::ReLU,                      // Hidden 2: 24 (Corner geometry & upcoming curvature)
+                Activation::Tanh,                      // Hidden 3: 16 (Grip boundaries & drift control)
+                Activation::Tanh,                      // Hidden 4: 12 (Fine motor steering & trail braking)
+                Activation::Tanh,                      // Output: 2 (Steering & Throttle/Brake)
             ],
             rng,
         )
@@ -328,10 +328,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let net = NeuralNetwork::default_car_brain(&mut rng);
 
-        assert_eq!(net.layer_sizes, vec![12, 32, 24, 16, 12, 2]);
+        assert_eq!(net.layer_sizes, vec![14, 32, 24, 16, 12, 2]);
         assert_eq!(net.layers.len(), 5);
 
-        let input = vec![0.5, 0.6, 0.7, 0.8, 0.9, 0.4, 0.3, 0.5, 0.2, 0.75, 0.0, 0.1];
+        let input = vec![0.5, 0.6, 0.7, 0.8, 0.9, 0.4, 0.3, 0.5, 0.2, 0.75, 0.0, 0.0, 0.1, -0.2];
         let (output, activations) = net.forward_with_cache(&input);
 
         assert_eq!(output.len(), 2);

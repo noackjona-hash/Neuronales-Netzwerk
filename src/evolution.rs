@@ -1,6 +1,6 @@
 //! Genetic Algorithm and Population Evolution engine built from scratch.
 //! Features Adaptive Hypermutation, Stagnation Detection, Novelty Injection (Random Immigrants),
-//! Elitism, and Multi-Mode Parent Selection to escape local minima and prevent premature convergence.
+//! Elitism, Multi-Mode Parent Selection, and Convergence / Perfection Detection.
 
 #![allow(dead_code)]
 
@@ -20,17 +20,18 @@ pub enum SelectionMethod {
     RankBased,
 }
 
-/// Evolution Hyperparameters with dynamic adaptive mutation.
+/// Evolution Hyperparameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionConfig {
     pub population_size: usize,
-    pub elitism_count: usize,       // Top N agents preserved untouched
-    pub base_mutation_rate: f32,    // Base probability of mutating each weight
-    pub base_mutation_strength: f32,// Base Gaussian standard deviation
-    pub tournament_size: usize,     // Tournament candidates
+    pub elitism_count: usize,
+    pub base_mutation_rate: f32,
+    pub base_mutation_strength: f32,
+    pub tournament_size: usize,
     pub selection_method: SelectionMethod,
-    pub max_generation_time: f32,   // Maximum seconds per generation
-    pub novelty_ratio: f32,         // Ratio of population reserved for fresh random explorers (e.g. 0.15)
+    pub max_generation_time: f32,
+    pub novelty_ratio: f32,
+    pub target_laps_for_perfection: usize, // e.g. 3 full laps to consider the circuit mastered
 }
 
 impl Default for EvolutionConfig {
@@ -44,6 +45,7 @@ impl Default for EvolutionConfig {
             selection_method: SelectionMethod::Tournament,
             max_generation_time: 45.0,
             novelty_ratio: 0.15,
+            target_laps_for_perfection: 3,
         }
     }
 }
@@ -76,7 +78,6 @@ impl Agent {
         }
     }
 
-    /// Step agent forward: read 12 telemetry inputs -> compute deep brain -> apply car controls -> integrate physics.
     pub fn step(&mut self, dt: f32, track: &Track) {
         if !self.car.is_alive {
             return;
@@ -85,13 +86,11 @@ impl Agent {
         let inputs = self.car.get_network_inputs();
         let outputs = self.brain.forward(&inputs);
 
-        // Output 0: Steering in [-1.0, 1.0]
         let steer = outputs[0].clamp(-1.0, 1.0);
 
-        // Output 1: Throttle & Brake
         let gas_brake = outputs[1];
         let (throttle, brake) = if gas_brake >= 0.0 {
-            (0.15 + 0.85 * gas_brake.clamp(0.0, 1.0), 0.0)
+            (0.12 + 0.88 * gas_brake.clamp(0.0, 1.0), 0.0)
         } else {
             (0.0, (-gas_brake).clamp(0.0, 1.0))
         };
@@ -144,7 +143,7 @@ pub struct GenerationStats {
     pub mutation_temperature: f32,
 }
 
-/// The evolutionary population manager with anti-stagnation mechanisms.
+/// The evolutionary population manager with anti-stagnation and perfection criteria.
 pub struct Population {
     pub config: EvolutionConfig,
     pub agents: Vec<Agent>,
@@ -158,9 +157,13 @@ pub struct Population {
     pub best_current_agent_idx: usize,
     pub stats_history: Vec<GenerationStats>,
 
+    // Perfection & Convergence
+    pub is_perfectly_trained: bool,
+    pub perfect_agent_idx: Option<usize>,
+
     // Stagnation & Adaptive Mutation Engine
     pub stagnant_generations: usize,
-    pub mutation_temperature: f32, // Multiplier for mutation strength (1.0 = normal, 3.0+ = heat burst)
+    pub mutation_temperature: f32,
 }
 
 impl Population {
@@ -183,6 +186,8 @@ impl Population {
             best_ever_brain: None,
             best_current_agent_idx: 0,
             stats_history: Vec::new(),
+            is_perfectly_trained: false,
+            perfect_agent_idx: None,
             stagnant_generations: 0,
             mutation_temperature: 1.0,
         }
@@ -216,9 +221,17 @@ impl Population {
     pub fn step(&mut self, dt: f32, track: &Track) {
         self.generation_time += dt;
 
-        for agent in &mut self.agents {
+        for (i, agent) in self.agents.iter_mut().enumerate() {
             if agent.car.is_alive {
                 agent.step(dt, track);
+
+                // Check perfection criteria: car completed required flawless laps at speed
+                if agent.car.laps_completed >= self.config.target_laps_for_perfection && agent.car.top_speed_recorded > 30.0 {
+                    self.is_perfectly_trained = true;
+                    self.perfect_agent_idx = Some(i);
+                    self.best_ever_brain = Some(agent.brain.clone());
+                    self.best_ever_fitness = agent.fitness;
+                }
             }
         }
 
@@ -226,12 +239,13 @@ impl Population {
     }
 
     pub fn is_generation_over(&self) -> bool {
-        self.alive_count() == 0 || self.generation_time >= self.config.max_generation_time
+        self.is_perfectly_trained
+            || self.alive_count() == 0
+            || self.generation_time >= self.config.max_generation_time
     }
 
     /// Advance to the next generation with Adaptive Hypermutation & Novelty Injection.
     pub fn advance_generation(&mut self, track: &Track) {
-        // 1. Sort agents descending by fitness
         self.agents
             .sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -247,17 +261,22 @@ impl Population {
             .map(|a| a.car.top_speed_recorded)
             .fold(0.0f32, |acc, s| acc.max(s));
 
-        // 2. Check for Improvement or Stagnation
+        // Check if champion completed target laps
+        if max_laps >= self.config.target_laps_for_perfection {
+            self.is_perfectly_trained = true;
+            self.best_ever_brain = Some(self.agents[0].brain.clone());
+            self.best_ever_fitness = self.agents[0].fitness;
+        }
+
         let is_new_record = gen_best_fitness > self.best_ever_fitness + 50.0;
         if is_new_record {
             self.best_ever_fitness = gen_best_fitness;
             self.best_ever_brain = Some(self.agents[0].brain.clone());
             self.stagnant_generations = 0;
-            self.mutation_temperature = 1.0; // Cool down to fine-tune
+            self.mutation_temperature = 1.0;
         } else {
             self.stagnant_generations += 1;
-            // Adaptive Temperature Ramp: exponentially scale mutation if stuck
-            let heat_factor = 1.0 + (self.stagnant_generations as f32 * 0.12).min(4.0);
+            let heat_factor = 1.0 + (self.stagnant_generations as f32 * 0.14).min(4.0);
             self.mutation_temperature = heat_factor;
         }
 
@@ -274,7 +293,6 @@ impl Population {
             }
         }
 
-        // Record history
         self.stats_history.push(GenerationStats {
             generation: self.generation,
             best_fitness: gen_best_fitness,
@@ -289,16 +307,14 @@ impl Population {
             mutation_temperature: self.mutation_temperature,
         });
 
-        // 3. Compute Adaptive Mutation Hyperparameters
         let effective_mutation_rate = (self.config.base_mutation_rate * (1.0 + self.stagnant_generations as f32 * 0.04))
             .clamp(0.08, 0.40);
         let effective_mutation_strength = (self.config.base_mutation_strength * self.mutation_temperature)
             .clamp(0.20, 1.20);
 
-        // 4. Construct Next Generation
         let mut new_agents = Vec::with_capacity(self.config.population_size);
 
-        // A. Elitism: Keep Top N Champions intact
+        // A. Elitism
         let num_elites = self.config.elitism_count.min(self.agents.len());
         for i in 0..num_elites {
             let mut elite_agent = Agent::new(
@@ -312,22 +328,21 @@ impl Population {
             new_agents.push(elite_agent);
         }
 
-        // B. Champion Exploratory Variants (5% of population)
+        // B. Champion Exploratory Variants
         if let Some(champ) = &self.best_ever_brain {
             let champ_variants = ((self.config.population_size as f32) * 0.08).round() as usize;
             for _ in 0..champ_variants {
                 if new_agents.len() >= self.config.population_size { break; }
                 let mut variant = champ.clone();
-                // Mutate with higher strength
-                variant.mutate(effective_mutation_rate * 1.5, effective_mutation_strength * 1.3, &mut self.rng);
+                variant.mutate(effective_mutation_rate * 1.4, effective_mutation_strength * 1.3, &mut self.rng);
                 let id = new_agents.len();
                 let mut agent = Agent::new(id, track.start_position, track.start_angle, variant);
-                agent.color_rgba = [0, 255, 200, 240]; // Cyan aura
+                agent.color_rgba = [0, 255, 200, 240];
                 new_agents.push(agent);
             }
         }
 
-        // C. Novelty Random Immigrants (15% of population) to inject fresh genetic lineages
+        // C. Novelty Random Immigrants
         let num_novelty = ((self.config.population_size as f32) * self.config.novelty_ratio).round() as usize;
         for _ in 0..num_novelty {
             if new_agents.len() >= self.config.population_size { break; }
@@ -335,11 +350,11 @@ impl Population {
             let id = new_agents.len();
             let mut agent = Agent::new(id, track.start_position, track.start_angle, fresh_brain);
             agent.is_novelty_immigrant = true;
-            agent.color_rgba = [255, 105, 180, 240]; // Pink/purple aura
+            agent.color_rgba = [255, 105, 180, 240];
             new_agents.push(agent);
         }
 
-        // D. Main Population: Tournament Selection + Crossover + Adaptive Mutation
+        // D. Tournament Selection + Crossover + Mutation
         while new_agents.len() < self.config.population_size {
             let idx_a = select_parent_idx(
                 &self.agents,
@@ -372,7 +387,6 @@ impl Population {
             ));
         }
 
-        // 5. Install new generation
         self.agents = new_agents;
         self.generation += 1;
         self.generation_time = 0.0;
@@ -384,6 +398,8 @@ impl Population {
         self.generation_time = 0.0;
         self.stagnant_generations = 0;
         self.mutation_temperature = 1.0;
+        self.is_perfectly_trained = false;
+        self.perfect_agent_idx = None;
         self.stats_history.clear();
 
         for (i, agent) in self.agents.iter_mut().enumerate() {
@@ -402,6 +418,8 @@ impl Population {
         self.best_ever_fitness = 0.0;
         self.stagnant_generations = 0;
         self.mutation_temperature = 1.0;
+        self.is_perfectly_trained = false;
+        self.perfect_agent_idx = None;
 
         self.agents[0] = Agent::new(0, track.start_position, track.start_angle, brain.clone());
         self.agents[0].is_elite = true;
