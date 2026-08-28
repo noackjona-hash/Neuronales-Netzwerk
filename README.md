@@ -36,21 +36,28 @@ NeuronalesNetzwerk/
 - **Gaussian Random Sampling via Box-Muller Transform**:
   $$Z = \sqrt{-2 \ln U_1} \cos(2\pi U_2), \quad U_1, U_2 \sim \mathcal{U}(0, 1)$$
 
-### 2. Deep Feedforward Neural Network (`src/nn.rs`)
-- **Matrix Forward Pass**:
-  $$\mathbf{y}^{(l)} = \sigma\left(\mathbf{W}^{(l)} \mathbf{x}^{(l-1)} + \mathbf{b}^{(l)}\right)$$
-- **Supported Activations**:
-  - **ReLU**: $f(x) = \max(0, x)$
-  - **LeakyReLU**: $f(x) = \begin{cases} x & x \ge 0 \\ \alpha x & x < 0 \end{cases}$
-  - **Tanh**: $f(x) = \frac{e^x - e^{-x}}{e^x + e^{-x}}$
-  - **Sigmoid**: $f(x) = \frac{1}{1 + e^{-x}}$
-  - **Linear**: $f(x) = x$
-- **Weight Initialization**:
-  - He / Kaiming Normal for ReLU: $\sigma = \sqrt{\frac{2}{\text{fan\_in}}}$
-  - Xavier / Glorot Normal for Tanh/Sigmoid: $\sigma = \sqrt{\frac{2}{\text{fan\_in} + \text{fan\_out}}}$
-- **Topology & Caching**:
-  - `forward_with_cache(&self, input)` computes and caches intermediate layer activations for real-time visualization on the HUD.
-  - JSON serialization and deserialization for saving and loading champion brains.
+### 1. Realistic Vehicle Dynamics (`src/car.rs`)
+- **Non-Linear Bicycle Dynamics Model**:
+  - **Slip Angles**:
+    $$\alpha_f = \arctan\left(\frac{v + a \omega}{u}\right) - \delta, \quad \alpha_r = \arctan\left(\frac{v - b \omega}{u}\right)$$
+  - **Dynamic Weight Transfer**:
+    $$F_{z,f} = W_f - \frac{h_{\text{cg}}}{L} m a_x, \quad F_{z,r} = W_r + \frac{h_{\text{cg}}}{L} m a_x$$
+  - **Pacejka/Tanh Non-Linear Lateral Tire Forces**:
+    $$F_{y,f} = - \mu F_{z,f} \cdot \tanh\left(\frac{C_f \alpha_f}{\mu F_{z,f}}\right), \quad F_{y,r} = - \mu F_{z,r} \cdot \tanh\left(\frac{C_r \alpha_r}{\mu F_{z,r}}\right)$$
+  - **Yaw Torque & Accelerations**:
+    $$\tau_z = a (F_{y,f} \cos\delta + F_{x,f} \sin\delta) - b F_{y,r}, \quad \dot{\omega} = \frac{\tau_z}{I_z}$$
+  - **Skid Marks**: Emits persistent asphalt tire rubber trails during hard drifts or heavy braking!
+  - **Physically Steered Front Wheels**: Rendered with exact steering angle $\delta$ on the vehicle chassis.
+
+### 2. Deep Multi-Layer Neural Network (`src/nn.rs`)
+- **6-Layer Deep Architecture (`[11 -> 32 -> 24 -> 16 -> 12 -> 2]`)**:
+  - **11 Inputs**: 7 Raycast distances, Longitudinal Speed $u$, Lateral Slip $v$, Yaw Rate $\omega$, Steer Angle $\delta$.
+  - **Hidden Layer 1 (32 Neurons, LeakyReLU)**: Spatial environment & wall perception.
+  - **Hidden Layer 2 (24 Neurons, ReLU)**: Apex identification & corner curvature recognition.
+  - **Hidden Layer 3 (16 Neurons, Tanh)**: Vehicle slip limit & lateral grip modeling.
+  - **Hidden Layer 4 (12 Neurons, Tanh)**: High-level racing line strategy & control blending.
+  - **Output Layer (2 Neurons, Tanh)**: Continuous Steering $[-1, 1]$ and Gas/Brake $[-1, 1]$.
+- **Dynamic Neural Visualizer HUD**: Dynamically scales and renders any number of deep layers with weight-coded synaptic lines and live neuron firing rates.
 
 ### 3. Vehicle Dynamics & Sensor Array (`src/car.rs`)
 - **Arcade/Semi-Realistic Physics**:
